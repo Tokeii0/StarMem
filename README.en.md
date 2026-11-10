@@ -31,7 +31,7 @@ cargo install --path . --locked
 starmem --version
 ```
 
-From an existing checkout, run the install command at the repository root. Make sure Cargo's `bin` directory is on your `PATH`. CI builds host binaries for Windows x64, Linux x64, and macOS arm64. Each successful run provides the binary, Cargo package, and verification manifest for download. [Build runs](https://github.com/Tokeii0/StarMem/actions/workflows/ci.yml)
+From an existing checkout, run the install command at the repository root. Make sure Cargo's `bin` directory is on your `PATH`. CI builds host binaries for Windows x64, Linux x64, and macOS arm64. Windows and Linux release binaries are packed with UPX. macOS uses the native executable format. Each successful run provides the binary, Cargo package, and verification manifest for download. [Build runs](https://github.com/Tokeii0/StarMem/actions/workflows/ci.yml)
 
 ## Quick start
 

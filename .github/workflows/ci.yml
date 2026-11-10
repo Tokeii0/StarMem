@@ -18,9 +18,14 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             exe: ""
+            upx_asset: amd64_linux.tar.xz
+            upx_sha256: 79cea8a50b6fa102d10c7b79a419cd77dead3cc2d78661de2dc5e5815dc505c1
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             exe: .exe
+            upx_asset: win64.zip
+            upx_sha256: d127996c76615e431be810e9c8d2910dbe3dd400600c5c0c50276fc5a17a9705
+          # UPX 5.3.0 disables packing Mach-O binaries for modern macOS.
           - os: macos-15
             target: aarch64-apple-darwin
             exe: ""
@@ -75,6 +80,33 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Compress release binary with UPX
+        if: matrix.upx_asset
+        shell: bash
+        env:
+          UPX_VERSION: '5.3.0'
+          UPX_ASSET: ${{ matrix.upx_asset }}
+          UPX_SHA256: ${{ matrix.upx_sha256 }}
+          EXE_SUFFIX: ${{ matrix.exe }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          directory=target/upx
+          archive="upx-$UPX_VERSION-$UPX_ASSET"
+          mkdir -p "$directory"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$directory/$archive" \
+            "https://github.com/upx/upx/releases/download/v$UPX_VERSION/$archive"
+          printf '%s  %s\n' "$UPX_SHA256" "$directory/$archive" | sha256sum --check
+          if [[ "$archive" == *.zip ]]; then
+            python -m zipfile -e "$directory/$archive" "$directory"
+          else
+            tar -xJf "$directory/$archive" -C "$directory"
+          fi
+          upx="$directory/upx-$UPX_VERSION-${UPX_ASSET%%.*}/upx$EXE_SUFFIX"
+          binary="target/$RUST_TARGET/release/starmem$EXE_SUFFIX"
+          "$upx" --best "$binary"
+          "$upx" --test "$binary"
 
       - name: Verify live command-equivalence coverage
         shell: bash

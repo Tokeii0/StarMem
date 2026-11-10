@@ -35,7 +35,7 @@ cargo install --path . --locked
 starmem --version
 ```
 
-已有检出可直接在仓库根目录运行安装命令。确保 Cargo 的 `bin` 目录在 `PATH` 中。CI 为 Windows x64、Linux x64 和 macOS arm64 构建宿主程序。运行通过后可在对应的 Actions 页面下载二进制、Cargo 包和校验清单。 [构建记录](https://github.com/Tokeii0/StarMem/actions/workflows/ci.yml)
+已有检出可直接在仓库根目录运行安装命令。确保 Cargo 的 `bin` 目录在 `PATH` 中。CI 为 Windows x64、Linux x64 和 macOS arm64 构建宿主程序。Windows 和 Linux 发布二进制使用 UPX 压缩，macOS 保持原生可执行格式。运行通过后可在对应的 Actions 页面下载二进制、Cargo 包和校验清单。 [构建记录](https://github.com/Tokeii0/StarMem/actions/workflows/ci.yml)
 
 ## 快速开始
 
