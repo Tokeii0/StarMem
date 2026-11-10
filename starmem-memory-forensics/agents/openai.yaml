@@ -1,4 +1,0 @@
-interface:
-  display_name: "StarMem 内存取证"
-  short_description: "使用 StarMem 分析 Windows 内存镜像并提取可验证证据"
-  default_prompt: "Use $starmem-memory-forensics to analyze this Windows memory image and preserve verifiable evidence."
