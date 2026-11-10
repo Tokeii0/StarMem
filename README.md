@@ -116,7 +116,7 @@ starmem linux.sockstat ./linux.lime --symbol-path /path/to/linux-isf/symbols
 
 SQLite 会追加独立分析批次。查询插件表时用 `analysis_id` 限定批次，并先查看 `plugin_runs` 的运行状态。
 
-普通导出默认保护输入和已有输出。`--force` 仅可替换声明的普通输出。带 `.partial` 的恢复产物含未恢复区段，复核时应同时查看缺页清单和实际恢复字节数。详见 [证据解释](starmem-memory-forensics/references/evidence-interpretation.md)。
+普通导出默认保护输入和已有输出。`--force` 仅可替换声明的普通输出。带 `.partial` 的恢复产物含未恢复区段，复核时应同时查看缺页清单和实际恢复字节数。详见 [证据校验](docs/VALIDATION.md)。
 
 ## Rust API
 

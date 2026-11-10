@@ -1,4 +1,4 @@
-// Product name rules adapted from MemNixFS (Apache-2.0); see THIRD_PARTY_NOTICES.md.
+// Product name rules adapted from MemNixFS (Apache-2.0); see licenses/NOTICE.md.
 pub(super) const AV_SIGNATURES: &[(&str, u8, &str, &str)] = &[
     ("falcon-sensor", 3, "CrowdStrike", "Falcon Sensor"),
     ("falconctl", 1, "CrowdStrike", "Falcon Sensor"),

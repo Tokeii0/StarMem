@@ -31,4 +31,4 @@ VMware VMEM + VMSS/VMSN、ELF physical core、Xen ELF64、AVML v2 和 QEVM v3 �
 3. 比较告警、预算和缺失区间，再核对恢复产物的实际字节数与摘要。
 4. 分享验证结论时，提供脱敏的最小复现或相应的合成测试。
 
-[贡献指南](../CONTRIBUTING.md) · [横评复现](../benchmarks/README.md) · [证据解释](../starmem-memory-forensics/references/evidence-interpretation.md)
+[贡献指南](../CONTRIBUTING.md) · [横评复现](../benchmarks/README.md)

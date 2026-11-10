@@ -112,7 +112,7 @@ Set `STARMEM_SYMBOL_PATH` for shared read-only symbol roots. Use `--cache` or `S
 
 SQLite appends each analysis as a separate run. Filter plugin tables by `analysis_id` and check the run status in `plugin_runs`.
 
-Exports protect inputs and existing outputs by default. `--force` allows replacement of declared regular outputs. A `.partial` artifact has unrecovered ranges. Review its missing ranges and recovered byte count together. See [interpreting evidence](starmem-memory-forensics/references/evidence-interpretation.md).
+Exports protect inputs and existing outputs by default. `--force` allows replacement of declared regular outputs. A `.partial` artifact has unrecovered ranges. Review its missing ranges and recovered byte count together. See [evidence validation](docs/VALIDATION.md).
 
 ## Rust API
 
@@ -137,4 +137,4 @@ Contributions to docs, translations, tests, and forensic analysis are welcome. S
 
 StarMem's original material is licensed under the GNU Lesser General Public License 3.0, identified by SPDX as `LGPL-3.0-only`. Include both license texts when distributing StarMem and follow the applicable source availability terms. [LGPL 3.0](LICENSE) · [GPL 3.0](licenses/LICENSE-GPL)
 
-For distribution of a combined work linked with StarMem, see LGPL section 4. Third-party materials retain their own licenses, and previously granted rights remain in effect. [Crate integration guide](docs/CRATE_INTEGRATION.md) · [Third-party notices and prior licenses](THIRD_PARTY_NOTICES.md)
+For distribution of a combined work linked with StarMem, see LGPL section 4. Third-party materials retain their own licenses, and previously granted rights remain in effect. [Crate integration guide](docs/CRATE_INTEGRATION.md) · [Third-party notices and prior licenses](licenses/NOTICE.md)

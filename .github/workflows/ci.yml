@@ -128,8 +128,8 @@ jobs:
             --output "target/release-manifest-${{ matrix.target }}.json"
           python scripts/release_manifest.py verify "target/release-manifest-${{ matrix.target }}.json"
           mkdir -p target/licenses
-          cp LICENSE THIRD_PARTY_NOTICES.md target/
-          cp licenses/LICENSE-MIT licenses/LICENSE-APACHE licenses/LICENSE-GPL target/licenses/
+          cp LICENSE target/
+          cp licenses/LICENSE-MIT licenses/LICENSE-APACHE licenses/LICENSE-GPL licenses/NOTICE.md target/licenses/
 
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
@@ -141,7 +141,7 @@ jobs:
             target/package/*.crate
             target/release-manifest-${{ matrix.target }}.json
             target/LICENSE
-            target/THIRD_PARTY_NOTICES.md
+            target/licenses/NOTICE.md
             target/licenses/LICENSE-MIT
             target/licenses/LICENSE-APACHE
             target/licenses/LICENSE-GPL

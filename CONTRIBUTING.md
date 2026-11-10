@@ -4,7 +4,7 @@ StarMem 欢迎文档修订、翻译、回归测试、容器解析和取证插件
 
 可以直接克隆仓库、提交 Issue，或 Fork 后向主仓库提交 PR。 [项目 Issues](https://github.com/Tokeii0/StarMem/issues)
 
-StarMem 的原创部分采用 [LGPL 3.0](LICENSE)。第三方材料适用各自的许可。 [第三方声明](THIRD_PARTY_NOTICES.md)
+StarMem 的原创部分采用 [LGPL 3.0](LICENSE)。第三方材料适用各自的许可。 [第三方声明](licenses/NOTICE.md)
 
 [本地上手](#本地上手) · [代码地图](#代码地图) · [开发取证命令](#开发取证命令) · [验证](#验证) · [提交贡献](#提交贡献) · [English quick start](#english-quick-start)
 
@@ -53,7 +53,7 @@ cargo run --locked --bin starmem -- --json info target/contributor-smoke.raw
 4. **验证正向结果和失败边界。** 对结构验证、缺页、坏链、预算和取消中实际受影响的情况补回归。比较关键字段和证据地址，也验证报告的可用性、完整性和告警。
 5. **更新用法。** 写出一个可复制的调用示例，说明参数和输出范围。修改帮助后运行两种语言，确认别名和嵌套命令正常。
 
-Evidence Envelope 的 `available` 表示证据是否可用，`complete` 对声明的 `scope` 生效。达到扫描预算、结构校验失败或页面缺失时，应通过 `limits`、`warnings` 和 `missing_ranges` 表达对应边界。导出类命令应使用现有输出策略保护输入和已有产物。 [Evidence Envelope v1](schemas/evidence-envelope-v1.schema.json) · [证据解释](starmem-memory-forensics/references/evidence-interpretation.md)
+Evidence Envelope 的 `available` 表示证据是否可用，`complete` 对声明的 `scope` 生效。达到扫描预算、结构校验失败或页面缺失时，应通过 `limits`、`warnings` 和 `missing_ranges` 表达对应边界。导出类命令应使用现有输出策略保护输入和已有产物。 [Evidence Envelope v1](schemas/evidence-envelope-v1.schema.json)
 
 ## 验证
 
@@ -99,7 +99,7 @@ git fetch origin
 git switch -c fix/example origin/main
 ```
 
-引用或改编第三方代码时，请在 PR 中说明来源，并保留适用的许可和署名。 [第三方声明](THIRD_PARTY_NOTICES.md)
+引用或改编第三方代码时，请在 PR 中说明来源，并保留适用的许可和署名。 [第三方声明](licenses/NOTICE.md)
 
 PR 描述可使用以下结构。
 

@@ -20,7 +20,7 @@ include = [
     "/licenses/LICENSE-GPL",
     "/licenses/LICENSE-MIT",
     "/licenses/LICENSE-APACHE",
-    "/THIRD_PARTY_NOTICES.md",
+    "/licenses/NOTICE.md",
     "/metadata/leaf-command-manifest.json",
     "/benchmarks/command-equivalence.json",
     "/schemas/command-registry-v1.schema.json",

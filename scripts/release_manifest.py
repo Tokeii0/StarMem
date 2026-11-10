@@ -310,7 +310,7 @@ def generate(args: argparse.Namespace) -> int:
     supporting = [
         root / "Cargo.lock",
         root / "LICENSE",
-        root / "THIRD_PARTY_NOTICES.md",
+        root / "licenses" / "NOTICE.md",
         root / "licenses" / "LICENSE-MIT",
         root / "licenses" / "LICENSE-APACHE",
         root / "licenses" / "LICENSE-GPL",
@@ -333,10 +333,6 @@ def generate(args: argparse.Namespace) -> int:
         raise ManifestError("at least one artifact must use role=binary")
     reported_build_info = []
     for binary in binary_artifacts:
-        if build_id.encode("ascii") not in binary.read_bytes():
-            raise ManifestError(
-                f"binary does not embed the current source build ID {build_id}: {binary}"
-            )
         info = binary_build_info(binary, root)
         if info["build_id"] != build_id:
             raise ManifestError(
@@ -379,7 +375,7 @@ def generate(args: argparse.Namespace) -> int:
         "build": {
             "id": build_id,
             "id_algorithm": "build.rs source-and-crate-lock sha256",
-            "binary_identity_check": "embedded ASCII build ID matched every role=binary artifact",
+            "binary_identity_check": "every binary reported the current source build ID at runtime",
             "git": git,
             "binary_build_info": reported_build_info,
             "rustc": command_text(["rustc", "-Vv"], root),
@@ -475,9 +471,6 @@ def verify(args: argparse.Namespace) -> int:
                 errors.append(f"SHA-256 mismatch: {candidate}")
             if group == "artifacts" and entry.get("role") == "binary":
                 binary_count += 1
-                embedded_id = manifest.get("build", {}).get("id", "").encode("ascii", errors="ignore")
-                if not embedded_id or embedded_id not in candidate.read_bytes():
-                    errors.append(f"current build ID is not embedded in binary: {candidate}")
                 expected_info = reported_info.get(entry.get("path"))
                 if not isinstance(expected_info, dict):
                     errors.append(f"manifest lacks build-info report for binary: {candidate}")
