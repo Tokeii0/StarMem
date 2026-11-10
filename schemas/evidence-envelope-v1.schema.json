@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/evidence-envelope-v1.schema.json",
+  "title": "StarMem Evidence Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "engine_identity",
+    "source_identity",
+    "available",
+    "complete",
+    "scope",
+    "warnings",
+    "limits",
+    "missing_ranges",
+    "raw_evidence",
+    "data"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "command": { "$ref": "#/$defs/stableIdentifier" },
+    "engine_identity": { "$ref": "#/$defs/engineIdentity" },
+    "source_identity": { "$ref": "#/$defs/sourceIdentity" },
+    "available": { "type": "boolean" },
+    "complete": { "type": "boolean" },
+    "scope": { "$ref": "#/$defs/scope" },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/warning" }
+    },
+    "limits": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/limit" }
+    },
+    "missing_ranges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/missingRange" }
+    },
+    "raw_evidence": { "$ref": "#/$defs/rawEvidence" },
+    "data": true
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["available"],
+        "properties": { "available": { "const": false } }
+      },
+      "then": {
+        "properties": { "complete": { "const": false } }
+      }
+    }
+  ],
+  "$defs": {
+    "stableIdentifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": { "type": "string", "minLength": 1 },
+        "value": { "type": "string", "minLength": 1 }
+      }
+    },
+    "engineIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "build_id", "integration_api_version"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "build_id": { "type": "string", "minLength": 1 },
+        "integration_api_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sourceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "size", "mtime", "sample_digest", "symbol_identity"],
+      "properties": {
+        "format": { "type": "string", "minLength": 1 },
+        "size": { "type": "integer", "minimum": 0 },
+        "mtime": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unix_nanos"],
+              "properties": {
+                "unix_nanos": { "type": "string", "pattern": "^[0-9]+$" }
+              }
+            }
+          ]
+        },
+        "sample_digest": { "$ref": "#/$defs/digest" },
+        "symbol_identity": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/symbolIdentity" }
+          ]
+        },
+        "components": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceComponent" }
+        },
+        "physical_layout": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/physicalLayout" }
+          ]
+        }
+      }
+    },
+    "sourceComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "role", "name", "size", "mtime", "sample_digest"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "role": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "size": { "type": "integer", "minimum": 0 },
+        "mtime": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unix_nanos"],
+              "properties": { "unix_nanos": { "type": "string", "pattern": "^[0-9]+$" } }
+            }
+          ]
+        },
+        "sample_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "physicalLayout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mapping_count", "mapped_bytes", "digest", "missing_ranges", "excluded_ranges"],
+      "properties": {
+        "mapping_count": { "type": "integer", "minimum": 0 },
+        "mapped_bytes": { "type": "integer", "minimum": 0 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "missing_ranges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/missingRange" }
+        },
+        "excluded_ranges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/missingRange" }
+        }
+      }
+    },
+    "symbolIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "key", "digest", "details"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 },
+        "digest": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/digest" }
+          ]
+        },
+        "details": { "type": "object" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description", "constraints"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "description": { "type": ["string", "null"] },
+        "constraints": { "type": "object" }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message", "source", "context"],
+      "properties": {
+        "code": { "$ref": "#/$defs/stableIdentifier" },
+        "severity": { "enum": ["info", "warning", "error"] },
+        "message": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "context": { "type": "object" }
+      }
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "configured", "observed", "reached"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["source-scan", "output", "bytes"] },
+        "configured": { "type": ["integer", "null"], "minimum": 0 },
+        "observed": { "type": ["integer", "null"], "minimum": 0 },
+        "reached": { "type": ["boolean", "null"] }
+      }
+    },
+    "missingRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address_space", "start", "length", "source"],
+      "properties": {
+        "address_space": { "type": "string", "minLength": 1 },
+        "start": { "type": "integer", "minimum": 0 },
+        "length": { "type": "integer", "minimum": 1 },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rawEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "storage", "references"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "storage": { "enum": ["none", "inline", "jsonl", "sqlite", "file"] },
+        "references": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rawReference" }
+        }
+      }
+    },
+    "rawReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "hash"],
+      "properties": {
+        "path": { "type": ["string", "null"] },
+        "hash": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/digest" }
+          ]
+        }
+      },
+      "anyOf": [
+        { "properties": { "path": { "type": "string", "minLength": 1 } } },
+        { "properties": { "hash": { "$ref": "#/$defs/digest" } } }
+      ]
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/raw-object-v1.schema.json",
+  "title": "StarMem raw evidence object v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "plugin_id",
+    "object_type",
+    "address_space",
+    "address",
+    "semantic_key",
+    "fields",
+    "validation",
+    "provenance",
+    "missing_ranges"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "evidence_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "plugin_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*$"
+    },
+    "object_type": { "type": "string", "minLength": 1 },
+    "address_space": { "type": "string", "minLength": 1 },
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]{16}$" },
+    "semantic_key": { "type": "string", "minLength": 1 },
+    "fields": true,
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "method", "checks"],
+      "properties": {
+        "valid": { "type": ["boolean", "null"] },
+        "method": { "type": "string", "minLength": 1 },
+        "checks": { "type": "object" }
+      }
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "locator", "relation"],
+        "properties": {
+          "source": { "type": "string", "minLength": 1 },
+          "locator": { "type": ["string", "null"] },
+          "relation": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "missing_ranges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["address_space", "start", "length", "source"],
+        "properties": {
+          "address_space": { "type": "string", "minLength": 1 },
+          "start": { "type": "integer", "minimum": 0 },
+          "length": { "type": "integer", "minimum": 1 },
+          "source": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

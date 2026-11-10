@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/leaf-command-manifest-v1.json",
+  "title": "StarMem authoritative leaf-command declarations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schema_version", "commands"],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schema_version": {"const": 1},
+    "commands": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/leafCommandDeclaration"}
+    }
+  },
+  "$defs": {
+    "argument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value_type", "required", "repeatable"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value_type": {
+          "enum": ["address", "boolean", "choice", "integer", "output_path", "path", "pattern", "string", "timestamp"]
+        },
+        "required": {"type": "boolean"},
+        "repeatable": {"type": "boolean"}
+      }
+    },
+    "inputRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "required"],
+      "properties": {
+        "role": {
+          "enum": ["auxiliary_file", "memory_image", "linux_isf", "output_directory", "pdb", "registry_hive", "search_pattern", "symbol_store"]
+        },
+        "required": {"type": "boolean"}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "media_type", "required"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["directory", "file", "structured_report"]},
+        "media_type": {"type": ["string", "null"]},
+        "required": {"type": "boolean"}
+      }
+    },
+    "evidenceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "adapter"],
+      "properties": {
+        "scope": {"type": "string", "minLength": 1},
+        "adapter": {"type": "string", "minLength": 1}
+      }
+    },
+    "leafCommandDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "cli_path",
+        "aliases",
+        "help",
+        "arguments",
+        "category",
+        "input_roles",
+        "outputs",
+        "derived_outputs",
+        "evidence_defaults",
+        "collect_disposition",
+        "collect_parameterized",
+        "equivalence_id"
+      ],
+      "properties": {
+        "command_id": {"type": "string", "pattern": "^[a-z0-9.-]+$"},
+        "cli_path": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "aliases": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "help": {"type": "string", "minLength": 1},
+        "arguments": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/argument"}
+        },
+        "category": {
+          "enum": ["acquisition", "browser", "file_system", "kernel", "linux", "malware", "network", "process", "registry", "release", "symbol", "timeline", "windows"]
+        },
+        "input_roles": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/inputRole"},
+          "uniqueItems": true
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/output"}
+        },
+        "derived_outputs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/output"}
+        },
+        "evidence_defaults": {"$ref": "#/$defs/evidenceDefaults"},
+        "collect_disposition": {"enum": ["runnable", "conditional", "skipped", "unsupported"]},
+        "collect_parameterized": {"type": "boolean"},
+        "equivalence_id": {"type": "string", "pattern": "^[a-z0-9.-]+$"}
+      }
+    }
+  }
+}

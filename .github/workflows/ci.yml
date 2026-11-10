@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-package-release:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Validate Python and JSON engineering assets
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check jsonschema==4.23.0
+          python -m py_compile scripts/starmem_benchmark.py scripts/release_manifest.py scripts/check_package.py scripts/validate_json_schemas.py scripts/generate_leaf_command_manifest.py
+          python -m json.tool benchmarks/command-equivalence.json >/dev/null
+          python -m json.tool benchmarks/command-equivalence.schema.json >/dev/null
+          python -m json.tool benchmarks/corpus.example.json >/dev/null
+          python -m json.tool benchmarks/corpus.schema.json >/dev/null
+          python -m json.tool schemas/command-registry-v1.schema.json >/dev/null
+          python -m json.tool schemas/command-registry-v2.schema.json >/dev/null
+          python -m json.tool schemas/leaf-command-manifest-v1.schema.json >/dev/null
+          python -m json.tool metadata/leaf-command-manifest.json >/dev/null
+          python -m json.tool schemas/evidence-envelope-v1.schema.json >/dev/null
+          python -m json.tool schemas/host-api-v1.schema.json >/dev/null
+          python -m json.tool schemas/raw-object-v1.schema.json >/dev/null
+          python -m json.tool schemas/release-manifest-v1.schema.json >/dev/null
+          python scripts/validate_json_schemas.py
+          python scripts/starmem_benchmark.py validate benchmarks/corpus.example.json
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked --target ${{ matrix.target }}
+
+      - name: Reject package metadata pollution
+        run: python scripts/check_package.py --source .
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify live command-equivalence coverage
+        shell: bash
+        run: python -X utf8 scripts/starmem_benchmark.py validate benchmarks/corpus.example.json --starmem "target/${{ matrix.target }}/release/starmem${{ matrix.exe }}"
+
+      - name: Build Cargo package
+        run: cargo package --locked
+
+      - name: Inspect Cargo package archive
+        run: python scripts/check_package.py --source . --crate "target/package/starmem-*.crate"
+
+      - name: Generate release manifest
+        shell: bash
+        run: |
+          python scripts/release_manifest.py generate \
+            --target "${{ matrix.target }}" \
+            --artifact "binary=target/${{ matrix.target }}/release/starmem${{ matrix.exe }}" \
+            --artifact "crate=target/package/starmem-*.crate" \
+            --output "target/release-manifest-${{ matrix.target }}.json"
+          python scripts/release_manifest.py verify "target/release-manifest-${{ matrix.target }}.json"
+          mkdir -p target/licenses
+          cp LICENSE THIRD_PARTY_NOTICES.md target/
+          cp licenses/LICENSE-MIT licenses/LICENSE-APACHE licenses/LICENSE-GPL target/licenses/
+
+      - name: Upload release candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: starmem-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/starmem${{ matrix.exe }}
+            target/package/*.crate
+            target/release-manifest-${{ matrix.target }}.json
+            target/LICENSE
+            target/THIRD_PARTY_NOTICES.md
+            target/licenses/LICENSE-MIT
+            target/licenses/LICENSE-APACHE
+            target/licenses/LICENSE-GPL

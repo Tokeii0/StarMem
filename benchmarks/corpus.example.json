@@ -1,0 +1,253 @@
+{
+  "$schema": "./corpus.schema.json",
+  "schema_version": 1,
+  "suite": "windows-pslist-baseline-v1",
+  "description": "Template for local authorized RAW fixtures. Replace both placeholder identities and expected counts before checking the files.",
+  "images": [
+    {
+      "id": "damaged-list",
+      "path": "damaged-list.raw",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 4096,
+      "target_os": "windows",
+      "container": "raw",
+      "tags": [
+        "damaged_active_process_list"
+      ],
+      "symbol_identity": {
+        "kind": "windows-kernel-layout",
+        "identifiers": {},
+        "required": false
+      }
+    },
+    {
+      "id": "healthy-list",
+      "path": "healthy-list.raw",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "size_bytes": 4096,
+      "target_os": "windows",
+      "container": "raw",
+      "tags": [
+        "healthy_active_process_list"
+      ],
+      "symbol_identity": {
+        "kind": "windows-kernel-layout",
+        "identifiers": {},
+        "required": false
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "damaged-list-pslist",
+      "image": "damaged-list",
+      "mode": "expected_difference",
+      "timeout_seconds": 120,
+      "starmem": {
+        "argv": [
+          "--json",
+          "--no-progress",
+          "pslist",
+          "${IMAGE}"
+        ],
+        "records_path": "data.processes"
+      },
+      "volatility3": {
+        "argv": [
+          "-q",
+          "-r",
+          "json",
+          "-f",
+          "${IMAGE}",
+          "windows.pslist"
+        ],
+        "records_path": "$"
+      },
+      "comparison": {
+        "key_fields": [
+          {
+            "name": "pid",
+            "starmem": "pid",
+            "volatility3": "PID",
+            "transform": "int"
+          },
+          {
+            "name": "name",
+            "starmem": "name",
+            "volatility3": "ImageFileName",
+            "transform": "lower"
+          }
+        ]
+      },
+      "exit": {
+        "starmem": [
+          0
+        ],
+        "volatility3": [
+          0
+        ]
+      },
+      "resources": {
+        "starmem": {
+          "max_peak_rss_bytes": 6442450944
+        },
+        "volatility3": {
+          "max_peak_rss_bytes": 6442450944
+        }
+      },
+      "envelope": {
+        "starmem": {
+          "required_fields": [
+            "schema_version",
+            "available",
+            "complete",
+            "scope",
+            "warnings",
+            "limits",
+            "missing_ranges",
+            "source_identity"
+          ],
+          "equals": {
+            "available": true,
+            "complete": false
+          },
+          "warning_codes": [
+            "head_blink_mismatch"
+          ]
+        }
+      },
+      "gates": {
+        "positive": [
+          {
+            "tool": "starmem",
+            "path": "data.processes",
+            "min_count": 1
+          },
+          {
+            "tool": "starmem",
+            "path": "data.processes",
+            "max_count": 1
+          }
+        ],
+        "completeness": [
+          {
+            "tool": "starmem",
+            "path": "complete",
+            "equals": false
+          },
+          {
+            "tool": "starmem",
+            "path": "warnings",
+            "contains_warning_code": "head_blink_mismatch"
+          }
+        ]
+      },
+      "expected": {
+        "reason": "Example difference when the reference tool stops at a damaged active-process list and StarMem recovers a verified prefix."
+      }
+    },
+    {
+      "id": "healthy-list-pslist",
+      "image": "healthy-list",
+      "mode": "exact",
+      "timeout_seconds": 120,
+      "starmem": {
+        "argv": [
+          "--json",
+          "--no-progress",
+          "pslist",
+          "${IMAGE}"
+        ],
+        "records_path": "data.processes"
+      },
+      "volatility3": {
+        "argv": [
+          "-q",
+          "-r",
+          "json",
+          "-f",
+          "${IMAGE}",
+          "windows.pslist"
+        ],
+        "records_path": "$"
+      },
+      "comparison": {
+        "key_fields": [
+          {
+            "name": "pid",
+            "starmem": "pid",
+            "volatility3": "PID",
+            "transform": "int"
+          },
+          {
+            "name": "name",
+            "starmem": "name",
+            "volatility3": "ImageFileName",
+            "transform": "lower"
+          }
+        ]
+      },
+      "exit": {
+        "starmem": [
+          0
+        ],
+        "volatility3": [
+          0
+        ]
+      },
+      "resources": {
+        "starmem": {
+          "max_peak_rss_bytes": 6442450944
+        },
+        "volatility3": {
+          "max_peak_rss_bytes": 6442450944
+        }
+      },
+      "envelope": {
+        "starmem": {
+          "required_fields": [
+            "schema_version",
+            "available",
+            "complete",
+            "scope",
+            "warnings",
+            "limits",
+            "missing_ranges",
+            "source_identity"
+          ],
+          "equals": {
+            "available": true,
+            "complete": true
+          },
+          "warning_codes": []
+        }
+      },
+      "gates": {
+        "positive": [
+          {
+            "tool": "starmem",
+            "path": "data.processes",
+            "min_count": 1
+          },
+          {
+            "tool": "starmem",
+            "path": "data.processes",
+            "max_count": 1
+          }
+        ],
+        "completeness": [
+          {
+            "tool": "starmem",
+            "path": "complete",
+            "equals": true
+          },
+          {
+            "tool": "starmem",
+            "path": "warnings",
+            "max_count": 0
+          }
+        ]
+      }
+    }
+  ]
+}

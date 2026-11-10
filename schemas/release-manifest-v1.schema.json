@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/release-manifest-v1.json",
+  "title": "StarMem release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_utc", "package", "target", "build", "artifacts", "release_inputs"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_utc": {"type": "string", "format": "date-time"},
+    "package": {
+      "type": "object",
+      "required": ["name", "version", "license"],
+      "properties": {
+        "name": {"type": "string"},
+        "version": {"type": "string"},
+        "license": {"type": ["string", "null"]},
+        "rust_version": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "target": {"type": "string"},
+    "build": {
+      "type": "object",
+      "required": ["id", "id_algorithm", "binary_identity_check", "git", "binary_build_info", "rustc", "cargo", "host"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "id_algorithm": {"type": "string"},
+        "binary_identity_check": {"type": "string"},
+        "git": {
+          "type": "object",
+          "required": ["commit", "dirty"],
+          "properties": {
+            "commit": {"type": ["string", "null"]},
+            "dirty": {"type": ["boolean", "null"]}
+          },
+          "additionalProperties": false
+        },
+        "binary_build_info": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["artifact", "report"],
+            "properties": {
+              "artifact": {"type": "string"},
+              "report": {"$ref": "#/$defs/buildInfo"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "rustc": {"type": ["string", "null"]},
+        "cargo": {"type": ["string", "null"]},
+        "host": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/artifact"}
+    },
+    "release_inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/file"}
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "required": ["path", "size_bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["role", "path", "size_bytes", "sha256"],
+      "properties": {
+        "role": {"type": "string", "minLength": 1},
+        "path": {"type": "string"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "buildInfo": {
+      "type": "object",
+      "required": [
+        "version", "build_id", "git_commit", "dirty", "rust_target", "features",
+        "evidence_schema_version", "command_registry_schema_version",
+        "leaf_command_manifest_schema_version", "host_api_schema_version",
+        "integration_api_version", "sqlite_schema_version", "raw_object_schema_version"
+      ],
+      "properties": {
+        "version": {"type": "string"},
+        "build_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "git_commit": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]},
+        "rust_target": {"type": "string"},
+        "features": {"type": "array", "items": {"type": "string"}},
+        "evidence_schema_version": {"type": "integer", "minimum": 1},
+        "command_registry_schema_version": {"type": "integer", "minimum": 1},
+        "leaf_command_manifest_schema_version": {"type": "integer", "minimum": 1},
+        "host_api_schema_version": {"type": "integer", "minimum": 1},
+        "integration_api_version": {"type": "integer", "minimum": 1},
+        "sqlite_schema_version": {"type": "integer", "minimum": 1},
+        "raw_object_schema_version": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/command-registry-v1.json",
+  "title": "StarMem leaf command registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "equivalence_schema_version", "source", "commands"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "equivalence_schema_version": {"const": 1},
+    "source": {"const": "embedded-command-equivalence-v1"},
+    "commands": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/leafCommandContract"}
+    }
+  },
+  "$defs": {
+    "metadataStatus": {
+      "enum": ["known", "unknown", "none"]
+    },
+    "textMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value"],
+      "properties": {
+        "status": {"$ref": "#/$defs/metadataStatus"},
+        "value": {"type": ["string", "null"]}
+      }
+    },
+    "stringListMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "values"],
+      "properties": {
+        "status": {"$ref": "#/$defs/metadataStatus"},
+        "values": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "argumentContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value_type", "required", "repeatable"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value_type": {
+          "enum": ["unknown", "address", "boolean", "choice", "integer", "output_path", "path", "pattern", "string", "timestamp"]
+        },
+        "required": {"type": ["boolean", "null"]},
+        "repeatable": {"type": ["boolean", "null"]}
+      }
+    },
+    "argumentMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "items"],
+      "properties": {
+        "status": {"$ref": "#/$defs/metadataStatus"},
+        "items": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/argumentContract"}
+        }
+      }
+    },
+    "inputRoleContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "required"],
+      "properties": {
+        "role": {
+          "enum": ["unknown", "auxiliary_file", "memory_image", "linux_isf", "output_directory", "pdb", "registry_hive", "search_pattern", "symbol_store"]
+        },
+        "required": {"type": ["boolean", "null"]}
+      }
+    },
+    "inputRoleMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "roles"],
+      "properties": {
+        "status": {"$ref": "#/$defs/metadataStatus"},
+        "roles": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/inputRoleContract"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "outputContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "media_type", "required"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["unknown", "directory", "file", "structured_report"]},
+        "media_type": {"type": ["string", "null"]},
+        "required": {"type": ["boolean", "null"]}
+      }
+    },
+    "outputMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "items"],
+      "properties": {
+        "status": {"$ref": "#/$defs/metadataStatus"},
+        "items": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/outputContract"}
+        }
+      }
+    },
+    "evidenceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "adapter"],
+      "properties": {
+        "scope": {"$ref": "#/$defs/textMetadata"},
+        "adapter": {"$ref": "#/$defs/textMetadata"}
+      }
+    },
+    "nonEquivalentField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "reason"],
+      "properties": {
+        "field": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "equivalencePrerequisites": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "symbols", "acquisition_format"],
+      "properties": {
+        "platform": {
+          "type": "array",
+          "items": {"enum": ["windows", "linux"]},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "symbols": {"type": "string", "minLength": 1},
+        "acquisition_format": {
+          "type": "array",
+          "items": {"enum": ["raw", "crash_dump", "vmware_vmem", "vmware_snapshot", "lime", "elf_core", "xen_elf64", "avml_v2", "qevm_v3"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "equivalenceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "platform",
+        "volatility3_plugins",
+        "adapter",
+        "external_tool",
+        "comparable_fields",
+        "set_key",
+        "normalizer",
+        "non_equivalent_fields",
+        "prerequisites"
+      ],
+      "properties": {
+        "status": {"enum": ["exact", "partial", "no_equivalent"]},
+        "platform": {"enum": ["cross", "windows", "linux"]},
+        "volatility3_plugins": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "adapter": {"type": ["string", "null"]},
+        "external_tool": {"type": ["string", "null"]},
+        "comparable_fields": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "set_key": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "normalizer": {"type": "string", "minLength": 1},
+        "non_equivalent_fields": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/nonEquivalentField"}
+        },
+        "prerequisites": {"$ref": "#/$defs/equivalencePrerequisites"},
+        "notes": {"type": ["string", "null"]}
+      }
+    },
+    "leafCommandContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "command_id",
+        "cli_path",
+        "aliases",
+        "help",
+        "arguments",
+        "category",
+        "input_roles",
+        "outputs",
+        "derived_outputs",
+        "evidence_defaults",
+        "collect_disposition",
+        "equivalence"
+      ],
+      "properties": {
+        "contract_version": {"const": 1},
+        "command_id": {"type": "string", "pattern": "^[a-z0-9.-]+$"},
+        "cli_path": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "aliases": {"$ref": "#/$defs/stringListMetadata"},
+        "help": {"$ref": "#/$defs/textMetadata"},
+        "arguments": {"$ref": "#/$defs/argumentMetadata"},
+        "category": {
+          "enum": ["unknown", "acquisition", "browser", "file_system", "kernel", "linux", "malware", "network", "process", "registry", "release", "symbol", "timeline", "windows"]
+        },
+        "input_roles": {"$ref": "#/$defs/inputRoleMetadata"},
+        "outputs": {"$ref": "#/$defs/outputMetadata"},
+        "derived_outputs": {"$ref": "#/$defs/outputMetadata"},
+        "evidence_defaults": {"$ref": "#/$defs/evidenceDefaults"},
+        "collect_disposition": {"enum": ["unknown", "runnable", "conditional", "skipped", "unsupported"]},
+        "equivalence": {"$ref": "#/$defs/equivalenceRecord"}
+      }
+    }
+  }
+}

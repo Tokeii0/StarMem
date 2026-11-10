@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starmem.dev/schemas/command-equivalence-v1.json",
+  "title": "StarMem to Volatility 3 command equivalence table",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "starmem_cli_policy", "field_semantics", "volatility3_reference", "commands"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": 1},
+    "starmem_cli_policy": {"type": "string"},
+    "field_semantics": {"type": "string"},
+    "volatility3_reference": {
+      "type": "object",
+      "required": ["framework_version", "plugin_entry_count"],
+      "properties": {
+        "framework_version": {"type": "string"},
+        "plugin_entry_count": {"type": "integer", "minimum": 1},
+        "notes": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "status_definitions": {"type": "object", "additionalProperties": {"type": "string"}},
+    "commands": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "platform",
+          "volatility3_plugins",
+          "adapter",
+          "external_tool",
+          "comparable_fields",
+          "set_key",
+          "normalizer",
+          "non_equivalent_fields",
+          "prerequisites"
+        ],
+        "properties": {
+          "status": {"enum": ["exact", "partial", "composite", "no_equivalent"]},
+          "platform": {"enum": ["cross", "windows", "linux"]},
+          "volatility3_plugins": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "adapter": {"type": ["string", "null"]},
+          "external_tool": {"type": ["string", "null"]},
+          "comparable_fields": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "set_key": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+          "normalizer": {"type": "string", "minLength": 1},
+          "non_equivalent_fields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["field", "reason"],
+              "properties": {
+                "field": {"type": "string", "minLength": 1},
+                "reason": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false
+            }
+          },
+          "prerequisites": {
+            "type": "object",
+            "required": ["platform", "symbols", "acquisition_format"],
+            "properties": {
+              "platform": {
+                "type": "array",
+                "items": {"enum": ["windows", "linux"]},
+                "minItems": 1,
+                "uniqueItems": true
+              },
+              "symbols": {"type": "string", "minLength": 1},
+              "acquisition_format": {
+                "type": "array",
+                "items": {"enum": ["raw", "crash_dump", "vmware_vmem", "vmware_snapshot", "lime", "elf_core", "xen_elf64", "avml_v2", "qevm_v3"]},
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": false
+          },
+          "notes": {"type": "string"}
+        }
+      }
+    }
+  }
+}
