@@ -20,6 +20,10 @@
 
 StarMem 从物理内存镜像中提取进程、连接、驻留文件与系统活动。它适合用来建立应急排查基线、恢复镜像中仍驻留的字节，以及把结果交给脚本或取证工具复核。结构化报告会记录证据来源、扫描范围、缺页和限制。
 
+## 可视化界面版本 Lovelymemv3
+
+如果不喜欢CLI可以试试收费版本的Lovelymemv3，包含Starmem核心，[下载地址](https://lovely.mzy0.com/lovelymem.v3.exe)
+
 ## 安装
 
 需要 Rust **1.89+** 和目标平台的 C/C++ 构建工具链。Windows MSVC 目标需要 Visual Studio C++ Build Tools。可从源码安装。
