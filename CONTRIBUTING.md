@@ -4,7 +4,7 @@ StarMem 欢迎文档修订、翻译、回归测试、容器解析和取证插件
 
 可以直接克隆仓库、提交 Issue，或 Fork 后向主仓库提交 PR。 [项目 Issues](https://github.com/Tokeii0/StarMem/issues)
 
-StarMem 的原创部分采用 [LGPL 3.0](LICENSE)。第三方材料适用各自的许可。 [第三方声明](licenses/NOTICE.md)
+StarMem 采用 [LGPL 3.0](LICENSE)。
 
 [本地上手](#本地上手) · [代码地图](#代码地图) · [开发取证命令](#开发取证命令) · [验证](#验证) · [提交贡献](#提交贡献) · [English quick start](#english-quick-start)
 
