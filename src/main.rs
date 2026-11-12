@@ -7401,7 +7401,7 @@ fn run() -> Result<()> {
                         s.session_id, s.status, s.record_count, s.coordinate_unit
                     );
                     for warning in &s.warnings {
-                        eprintln!("  {warning}");
+                        warningln!("  {warning}");
                     }
                 }
                 print_plugin_footer(report.records.len(), report.complete, &report.warnings);
