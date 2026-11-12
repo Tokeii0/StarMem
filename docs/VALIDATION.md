@@ -45,6 +45,23 @@ cargo test --locked --test windows_x86_pae -- --include-ignored --nocapture
 复测，完整恢复 455 个进程，PID、PPID、EPROCESS、DTB、名称和创建时间与修复前逐条一致。
 定向单元/契约/集成测试共 61 项通过，`cargo check --locked --all-targets` 和源码包清单检查通过。
 
+## Lovelymem V3 同步与命令延迟回归（0.2.2）
+
+使用上述 4 GiB VMEM，在同一台 Windows 主机比较 `filescan memory.vmem --csv result.csv`。
+v0.2.1 的进程总耗时为 33.00 秒，反向页表映射耗时 30.50 秒；0.2.2 本地 release
+构建总耗时为 3.19 秒，反向映射为 0.20 秒。两份 CSV 的 14,745 条文件记录逐字段一致，
+均为 `complete=true`。这是单个真实镜像的对照结果，未将磁盘缓存状态固定为冷缓存，
+不代表所有镜像的加速比例。
+
+已复核 RAW 的 66 个进程和 VMEM 的 455 个进程。真实 RAW 的 `system-info --quick`
+默认不打印终端警告，添加 `--show-warnings` 后恢复警告，主体结果不变；JSON/CSV
+仍保留警告和 `complete=false`。不存在的镜像仍输出错误并以状态码 1 退出。
+
+本地 Windows 的 `cargo test --locked --all-targets --all-features` 通过 1,019 项测试，
+另有 1 项真实镜像测试默认忽略；macOS 符号转换脚本的 3 项测试通过。
+命令清单扩展到 179 项，并通过 Schema 和声明检查。新增命令的真实镜像覆盖范围
+不由命令数量推断；同步来源与适用边界见 [V3 同步记录](V3_SYNC.md)。
+
 ## 测试范围
 
 | 范围 | 验证重点 |

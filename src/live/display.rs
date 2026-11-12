@@ -37,6 +37,7 @@ impl DisplayGeometry {
         Ok(length as usize)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn allocation_length(self) -> Result<u64> {
         Ok((self.byte_length()? as u64).div_ceil(4096) * 4096)
     }

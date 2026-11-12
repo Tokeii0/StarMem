@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+#[cfg(any(windows, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,10 +25,13 @@ mod tests;
 mod windows;
 
 const PAGE_SIZE: u64 = 4096;
+#[cfg(any(windows, test))]
 const LOW_MEMORY_END: u64 = 0xc000_0000;
+#[cfg(any(windows, test))]
 const HIGH_MEMORY_START: u64 = 0x1_0000_0000;
 pub const MAX_LIVE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_LIVE_REQUESTS: usize = 256;
+#[cfg(any(windows, test))]
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,6 +210,7 @@ impl VmwareLiveReader {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn from_process(
         target: VmwareTarget,
         layout: VmwareLayout,
@@ -489,6 +494,7 @@ fn validate_requests(requests: &[LiveReadRequest]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 fn physical_ranges(region: &VmwareRegion, layout: VmwareLayout) -> Result<Vec<LivePhysicalRange>> {
     ensure!(
         region.length > 0
