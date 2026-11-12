@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 
 const PAGE_SIZE: u64 = 0x1000;
@@ -158,6 +159,35 @@ impl WindowsAddressSpace<'_> {
             Self::X86Pae(space) => space.read_u32(address).map(u64::from),
         }
     }
+
+    pub fn enumerate_mappings_cancellable(
+        &self,
+        region: VirtualAddressRegion,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<VirtualMappingReport> {
+        match self {
+            Self::X64(space) => space.enumerate_mappings_cancellable(region, limit, cancellation),
+            Self::X86Pae(space) => {
+                space.enumerate_mappings_cancellable(region, limit, cancellation)
+            }
+        }
+    }
+
+    pub fn reverse_translate_kernel_pages(
+        &self,
+        physical_pages: &HashSet<u64>,
+        max_mappings_per_page: usize,
+    ) -> Result<HashMap<u64, Vec<u64>>> {
+        match self {
+            Self::X64(space) => {
+                space.reverse_translate_kernel_pages(physical_pages, max_mappings_per_page)
+            }
+            Self::X86Pae(space) => {
+                space.reverse_translate_kernel_pages(physical_pages, max_mappings_per_page)
+            }
+        }
+    }
 }
 
 /// Windows x86 PAE address space.
@@ -232,6 +262,141 @@ impl<'a> X86PaeAddressSpace<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    pub fn enumerate_mappings(
+        &self,
+        region: VirtualAddressRegion,
+        limit: usize,
+    ) -> Result<VirtualMappingReport> {
+        self.enumerate_mappings_cancellable(region, limit, &CancellationToken::new())
+    }
+
+    pub fn enumerate_mappings_cancellable(
+        &self,
+        region: VirtualAddressRegion,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<VirtualMappingReport> {
+        ensure!(limit > 0, "地址映射结果上限必须大于零");
+        cancellation.check_cancelled()?;
+        let mut pdpt = [0u8; 32];
+        self.image
+            .read_physical(self.directory_table_base, &mut pdpt)?;
+        let indices = match region {
+            VirtualAddressRegion::User => 0..2usize,
+            VirtualAddressRegion::Kernel => 2..4usize,
+            VirtualAddressRegion::All => 0..4usize,
+        };
+        let budget = AtomicUsize::new(limit.saturating_add(1));
+        let mut state = MappingWalkState::default();
+        for index in indices {
+            cancellation.check_cancelled()?;
+            let entry = u64::from_le_bytes(pdpt[index * 8..index * 8 + 8].try_into()?);
+            if entry & 1 == 0 {
+                continue;
+            }
+            // PAE PDPTE bits 1/2 are reserved, not inherited access flags.
+            walk_mapping_pd(
+                self.image,
+                (index as u64) << 30,
+                entry & ADDRESS_MASK_4K,
+                PageFlags::root(),
+                &budget,
+                cancellation,
+                &mut state,
+            );
+        }
+        cancellation.check_cancelled()?;
+        state
+            .mappings
+            .sort_unstable_by_key(|mapping| mapping.virtual_start);
+        let mut mappings = merge_mappings(state.mappings);
+        let truncated =
+            state.truncated || budget.load(Ordering::Relaxed) == 0 || mappings.len() > limit;
+        mappings.truncate(limit);
+        if truncated {
+            push_mapping_warning(
+                &mut state.warnings,
+                format!("PAE 地址映射结果已按 {limit} 条硬上限截断"),
+            );
+        }
+        Ok(VirtualMappingReport {
+            directory_table_base: self.directory_table_base,
+            region: match region {
+                VirtualAddressRegion::User => "用户空间",
+                VirtualAddressRegion::Kernel => "内核空间",
+                VirtualAddressRegion::All => "全部地址空间",
+            }
+            .to_owned(),
+            mapped_bytes: mappings.iter().map(|mapping| mapping.length).sum(),
+            mapping_count: mappings.len(),
+            page_table_pages_read: state.page_table_pages + 1,
+            truncated,
+            mappings,
+            warnings: state.warnings,
+        })
+    }
+
+    /// PAE entries remain 64-bit even for a 32-bit guest. Walk the upper two
+    /// PDPT slots and retain only requested resident frames, with bounded aliases.
+    pub fn reverse_translate_kernel_pages(
+        &self,
+        physical_pages: &HashSet<u64>,
+        max_mappings_per_page: usize,
+    ) -> Result<HashMap<u64, Vec<u64>>> {
+        ensure!(max_mappings_per_page > 0, "物理页反向映射上限必须大于零");
+        let mut mappings = HashMap::<u64, Vec<u64>>::new();
+        if physical_pages.is_empty() {
+            return Ok(mappings);
+        }
+        for pdpt in 2..4u64 {
+            let Ok(directory) = self.entry(self.directory_table_base, pdpt, "PDPTE") else {
+                continue;
+            };
+            for pd in 0..512u64 {
+                let Ok(entry) = self.entry(directory.physical, pd, "PDE") else {
+                    continue;
+                };
+                let base_va = (pdpt << 30) | (pd << 21);
+                if !entry.transition && entry.value & (1 << 7) != 0 {
+                    let base_pa = entry.value & ADDRESS_MASK_2M;
+                    for &physical in physical_pages {
+                        if physical >= base_pa && physical - base_pa < 0x20_0000 {
+                            let aliases = mappings.entry(physical).or_default();
+                            if aliases.len() < max_mappings_per_page {
+                                aliases.push(base_va + physical - base_pa);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut table = [0u8; 4096];
+                if self
+                    .image
+                    .read_physical(entry.physical, &mut table)
+                    .is_err()
+                {
+                    continue;
+                }
+                for (pt, bytes) in table.chunks_exact(8).enumerate() {
+                    let raw = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    let Some(entry) = resident_page_table_entry(raw) else {
+                        continue;
+                    };
+                    if physical_pages.contains(&entry.physical) {
+                        let aliases = mappings.entry(entry.physical).or_default();
+                        if aliases.len() < max_mappings_per_page {
+                            aliases.push(base_va | ((pt as u64) << 12));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(mappings)
+    }
+
     fn entry(&self, table: u64, index: u64, level: &str) -> Result<ResidentPageTableEntry> {
         let value = self
             .image
@@ -260,6 +425,27 @@ impl<'a> X64AddressSpace<'a> {
 
     pub fn directory_table_base(&self) -> u64 {
         self.directory_table_base
+    }
+
+    /// Inspect the terminal 4 KiB PTE without interpreting a software PTE as
+    /// a physical address. Upper levels must still be resident. Compressed
+    /// pages need a separate, Windows-specific reconstruction path.
+    pub(crate) fn leaf_pte(&self, virtual_address: u64) -> Result<(u64, u64)> {
+        ensure!(
+            is_canonical(virtual_address),
+            "non-canonical virtual address"
+        );
+        let mut table = self.directory_table_base;
+        for (shift, level) in [(39, "PML4E"), (30, "PDPTE"), (21, "PDE")] {
+            let entry = self.entry(table, (virtual_address >> shift) & 0x1ff, level)?;
+            ensure!(
+                shift == 39 || entry.transition || entry.value & 0x80 == 0,
+                "large page does not have a terminal 4 KiB PTE"
+            );
+            table = entry.physical;
+        }
+        let physical = table + ((virtual_address >> 12) & 0x1ff) * 8;
+        Ok((physical, self.image.read_u64_physical(physical)?))
     }
 
     pub fn translate(&self, virtual_address: u64) -> Result<u64> {
@@ -317,7 +503,17 @@ impl<'a> X64AddressSpace<'a> {
         region: VirtualAddressRegion,
         limit: usize,
     ) -> Result<VirtualMappingReport> {
+        self.enumerate_mappings_cancellable(region, limit, &CancellationToken::new())
+    }
+
+    pub fn enumerate_mappings_cancellable(
+        &self,
+        region: VirtualAddressRegion,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<VirtualMappingReport> {
         ensure!(limit > 0, "地址映射结果上限必须大于零");
+        cancellation.check_cancelled()?;
         let pml4 = read_page_table(self.image, self.directory_table_base)?;
         let indices = match region {
             VirtualAddressRegion::User => 0usize..256,
@@ -331,7 +527,7 @@ impl<'a> X64AddressSpace<'a> {
         let partial = indices
             .into_par_iter()
             .filter_map(|index| {
-                if mapping_budget.load(Ordering::Relaxed) == 0 {
+                if cancellation.is_cancelled() || mapping_budget.load(Ordering::Relaxed) == 0 {
                     return None;
                 }
                 let entry = pml4[index];
@@ -351,11 +547,13 @@ impl<'a> X64AddressSpace<'a> {
                     table,
                     flags,
                     &mapping_budget,
+                    cancellation,
                     &mut state,
                 );
                 Some(state)
             })
             .collect::<Vec<_>>();
+        cancellation.check_cancelled()?;
         let mut mappings = Vec::new();
         let mut warnings = Vec::new();
         let mut page_table_pages_read = 1u64;
@@ -416,6 +614,7 @@ impl<'a> X64AddressSpace<'a> {
                 max_mappings_per_page,
                 usize::MAX,
                 None,
+                None,
             )?
             .mappings)
     }
@@ -447,6 +646,7 @@ impl<'a> X64AddressSpace<'a> {
                 region,
                 max_mappings_per_page,
                 usize::MAX,
+                None,
                 None,
             )?
             .mappings)
@@ -484,6 +684,7 @@ impl<'a> X64AddressSpace<'a> {
             max_mappings_per_page,
             page_table_entry_limit,
             None,
+            None,
         )
     }
 
@@ -509,6 +710,29 @@ impl<'a> X64AddressSpace<'a> {
             max_mappings_per_page,
             page_table_entry_limit,
             Some(alias_storage_limit),
+            None,
+        )
+    }
+
+    /// Bounded reverse mapping that checks cancellation during page-table traversal.
+    pub fn reverse_translate_pages_cancellable(
+        &self,
+        physical_pages: &HashSet<u64>,
+        region: VirtualAddressRegion,
+        max_mappings_per_page: usize,
+        page_table_entry_limit: usize,
+        alias_storage_limit: usize,
+        cancel: &crate::cancellation::CancellationToken,
+    ) -> Result<ReverseTranslationReport> {
+        ensure!(alias_storage_limit > 0, "反向 alias 存储上限必须大于零");
+        cancel.check_cancelled()?;
+        self.reverse_translate_pages_detailed_internal(
+            physical_pages,
+            region,
+            max_mappings_per_page,
+            page_table_entry_limit,
+            Some(alias_storage_limit),
+            Some(cancel),
         )
     }
 
@@ -519,6 +743,7 @@ impl<'a> X64AddressSpace<'a> {
         max_mappings_per_page: usize,
         page_table_entry_limit: usize,
         alias_storage_limit: Option<usize>,
+        cancel: Option<&crate::cancellation::CancellationToken>,
     ) -> Result<ReverseTranslationReport> {
         ensure!(max_mappings_per_page > 0, "反向地址映射结果上限必须大于零");
         ensure!(page_table_entry_limit > 0, "反向页表遍历工作上限必须大于零");
@@ -546,7 +771,12 @@ impl<'a> X64AddressSpace<'a> {
         }
         let target_lookup = PhysicalPageLookup::new(physical_pages);
         let pml4 = read_page_table(self.image, self.directory_table_base)?;
-        let traversal_budget = ReverseTraversalBudget::new(page_table_entry_limit);
+        let mut traversal_budget = ReverseTraversalBudget::new(page_table_entry_limit);
+        traversal_budget.cancel = cancel.cloned();
+        // Windows can alias an empty PT thousands of times. Only memoize PTs
+        // fully checked against this call's target set; a positive or partial
+        // table must still be walked under every virtual prefix.
+        let empty_target_pts = Mutex::new(HashSet::new());
         let aliases = Mutex::new(ReverseAliasAccumulator::new(
             max_mappings_per_page,
             alias_storage_limit,
@@ -617,6 +847,7 @@ impl<'a> X64AddressSpace<'a> {
                         &target_lookup,
                         &aliases,
                         &traversal_budget,
+                        &empty_target_pts,
                         &mut partial,
                     );
                 }
@@ -627,6 +858,9 @@ impl<'a> X64AddressSpace<'a> {
                 left
             });
         state.merge(partial);
+        if let Some(cancel) = cancel {
+            cancel.check_cancelled()?;
+        }
 
         let aliases = aliases
             .into_inner()
@@ -780,6 +1014,7 @@ struct ReverseTraversalBudget {
     configured: usize,
     remaining: AtomicUsize,
     exceeded: AtomicBool,
+    cancel: Option<crate::cancellation::CancellationToken>,
 }
 
 impl ReverseTraversalBudget {
@@ -788,10 +1023,14 @@ impl ReverseTraversalBudget {
             configured,
             remaining: AtomicUsize::new(configured),
             exceeded: AtomicBool::new(false),
+            cancel: None,
         }
     }
 
     fn consume_entry(&self) -> bool {
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return false;
+        }
         if self
             .remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -807,6 +1046,9 @@ impl ReverseTraversalBudget {
     }
 
     fn has_capacity(&self) -> bool {
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return false;
+        }
         if self.remaining.load(Ordering::Relaxed) > 0 {
             true
         } else {
@@ -1107,8 +1349,12 @@ fn walk_mapping_pdpt(
     table: u64,
     parent_flags: PageFlags,
     mapping_budget: &AtomicUsize,
+    cancellation: &CancellationToken,
     state: &mut MappingWalkState,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if mapping_budget.load(Ordering::Relaxed) == 0 {
         state.truncated = true;
         return;
@@ -1125,6 +1371,9 @@ fn walk_mapping_pdpt(
     };
     state.page_table_pages += 1;
     for (index, entry) in pdpt.into_iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return;
+        }
         if mapping_budget.load(Ordering::Relaxed) == 0 {
             state.truncated = true;
             break;
@@ -1147,6 +1396,7 @@ fn walk_mapping_pdpt(
                 entry & ADDRESS_MASK_4K,
                 flags,
                 mapping_budget,
+                cancellation,
                 state,
             );
         }
@@ -1159,8 +1409,12 @@ fn walk_mapping_pd(
     table: u64,
     parent_flags: PageFlags,
     mapping_budget: &AtomicUsize,
+    cancellation: &CancellationToken,
     state: &mut MappingWalkState,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if mapping_budget.load(Ordering::Relaxed) == 0 {
         state.truncated = true;
         return;
@@ -1177,6 +1431,9 @@ fn walk_mapping_pd(
     };
     state.page_table_pages += 1;
     for (index, entry) in pd.into_iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return;
+        }
         if mapping_budget.load(Ordering::Relaxed) == 0 {
             state.truncated = true;
             break;
@@ -1199,6 +1456,7 @@ fn walk_mapping_pd(
                 entry & ADDRESS_MASK_4K,
                 flags,
                 mapping_budget,
+                cancellation,
                 state,
             );
         }
@@ -1211,8 +1469,12 @@ fn walk_mapping_pt(
     table: u64,
     parent_flags: PageFlags,
     mapping_budget: &AtomicUsize,
+    cancellation: &CancellationToken,
     state: &mut MappingWalkState,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if mapping_budget.load(Ordering::Relaxed) == 0 {
         state.truncated = true;
         return;
@@ -1229,6 +1491,9 @@ fn walk_mapping_pt(
     };
     state.page_table_pages += 1;
     for (index, entry) in pt.into_iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return;
+        }
         if mapping_budget.load(Ordering::Relaxed) == 0 {
             state.truncated = true;
             break;
@@ -1314,6 +1579,7 @@ fn push_mapping_warning(warnings: &mut Vec<String>, warning: String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_pd_for_targets(
     image: &MemoryImage,
     virtual_prefix: u64,
@@ -1321,6 +1587,7 @@ fn walk_pd_for_targets(
     targets: &PhysicalPageLookup,
     aliases: &Mutex<ReverseAliasAccumulator>,
     traversal_budget: &ReverseTraversalBudget,
+    empty_target_pts: &Mutex<HashSet<u64>>,
     state: &mut ReverseWalkState,
 ) {
     if !traversal_budget.has_capacity() {
@@ -1359,11 +1626,13 @@ fn walk_pd_for_targets(
             targets,
             aliases,
             traversal_budget,
+            empty_target_pts,
             state,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_pt_for_targets(
     image: &MemoryImage,
     virtual_prefix: u64,
@@ -1371,8 +1640,16 @@ fn walk_pt_for_targets(
     targets: &PhysicalPageLookup,
     aliases: &Mutex<ReverseAliasAccumulator>,
     traversal_budget: &ReverseTraversalBudget,
+    empty_target_pts: &Mutex<HashSet<u64>>,
     state: &mut ReverseWalkState,
 ) {
+    if empty_target_pts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&table)
+    {
+        return;
+    }
     if !traversal_budget.has_capacity() {
         return;
     }
@@ -1385,8 +1662,10 @@ fn walk_pt_for_targets(
     };
     state.page_table_pages_read = state.page_table_pages_read.saturating_add(1);
     let mut matches = Vec::new();
+    let mut complete = true;
     for (pt_index, entry) in pt.into_iter().enumerate() {
         if !traversal_budget.consume_entry() {
+            complete = false;
             break;
         }
         let Some(entry) = resident_page_table_entry(entry) else {
@@ -1400,7 +1679,12 @@ fn walk_pt_for_targets(
             ));
         }
     }
-    if !matches.is_empty() {
+    if matches.is_empty() && complete {
+        let mut empty = empty_target_pts.lock().unwrap_or_else(|p| p.into_inner());
+        if empty.len() < 65_536 {
+            empty.insert(table);
+        }
+    } else if !matches.is_empty() {
         let mut aliases = aliases
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1502,6 +1786,125 @@ mod tests {
         assert_eq!(state.mappings.len(), 2);
         assert!(state.truncated);
         assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reverse_empty_aliases_do_not_starve_later_targets_or_leak_across_calls() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "starmem-empty-alias-{}-{nonce}.raw",
+            std::process::id()
+        ));
+        let mut bytes = vec![0; 0x8000];
+        put_u64(&mut bytes, 0x1000, 0x2003);
+        put_u64(&mut bytes, 0x2000, 0x3003);
+        // A heavily shared PT contains only a non-target mapping.
+        for i in 0..510 {
+            put_u64(&mut bytes, 0x3000 + i * 8, 0x4003);
+        }
+        put_u64(&mut bytes, 0x4000, 0x7003);
+        for i in 510..512 {
+            put_u64(&mut bytes, 0x3000 + i * 8, 0x5003);
+        }
+        put_u64(&mut bytes, 0x5000, 0x6003);
+        fs::write(&path, bytes).unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let space = X64AddressSpace::new(&image, 0x1000).unwrap();
+        let report = space
+            .reverse_translate_pages_detailed_with_budget(
+                &HashSet::from([0x6000]),
+                VirtualAddressRegion::User,
+                8,
+                4096,
+            )
+            .unwrap();
+        assert!(!report.traversal_limit_reached);
+        assert_eq!(report.mappings[&0x6000], vec![510 << 21, 511 << 21]);
+        // A new target set must revisit the previously negative PT.
+        let other = space
+            .reverse_translate_pages_detailed_with_budget(
+                &HashSet::from([0x7000]),
+                VirtualAddressRegion::User,
+                2,
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(other.mappings[&0x7000], vec![0, 1 << 21]);
+        assert!(other.mapping_limit_exceeded);
+        drop(image);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reverse_negative_cache_does_not_hide_partial_or_unreadable_tables() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "starmem-partial-pt-{}-{nonce}.raw",
+            std::process::id()
+        ));
+        let mut bytes = vec![0; 0x3000];
+        put_u64(&mut bytes, 0x1000 + 511 * 8, 0x2003);
+        fs::write(&path, bytes).unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let targets = PhysicalPageLookup::new(&HashSet::from([0x2000]));
+        let aliases = Mutex::new(ReverseAliasAccumulator::new(8, None));
+        let empty = Mutex::new(HashSet::new());
+        let budget = ReverseTraversalBudget::new(511);
+        let mut partial = ReverseWalkState::default();
+        walk_pt_for_targets(
+            &image,
+            0,
+            0x1000,
+            &targets,
+            &aliases,
+            &budget,
+            &empty,
+            &mut partial,
+        );
+        assert!(budget.exceeded());
+        assert!(empty.lock().unwrap().is_empty());
+        assert!(aliases.lock().unwrap().retained.is_empty());
+
+        let budget = ReverseTraversalBudget::new(512);
+        let mut complete = ReverseWalkState::default();
+        walk_pt_for_targets(
+            &image,
+            0,
+            0x1000,
+            &targets,
+            &aliases,
+            &budget,
+            &empty,
+            &mut complete,
+        );
+        assert!(!budget.exceeded());
+        assert_eq!(aliases.lock().unwrap().retained[&0x2000], vec![511 << 12]);
+        assert!(empty.lock().unwrap().is_empty());
+
+        let budget = ReverseTraversalBudget::new(512);
+        let mut unreadable = ReverseWalkState::default();
+        for _ in 0..2 {
+            walk_pt_for_targets(
+                &image,
+                0,
+                0x4000,
+                &targets,
+                &aliases,
+                &budget,
+                &empty,
+                &mut unreadable,
+            );
+        }
+        assert_eq!(unreadable.page_table_read_failures, 2);
+        assert!(empty.lock().unwrap().is_empty());
+        drop(image);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

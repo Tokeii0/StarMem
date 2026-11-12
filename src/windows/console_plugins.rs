@@ -9,6 +9,8 @@ use crate::address::{VirtualAddressRegion, X64AddressSpace};
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 
+mod legacy;
+
 #[derive(Debug, Serialize)]
 pub struct CommandHistoryReport {
     pub records: Vec<CommandHistoryRecord>,
@@ -129,7 +131,23 @@ pub fn command_histories(
     profile: &KernelProfile,
     limit: usize,
 ) -> Result<CommandHistoryReport> {
-    let artifacts = scan_console_artifacts(image, kernel, profile, limit, false)?;
+    command_histories_cancellable(
+        image,
+        kernel,
+        profile,
+        limit,
+        &crate::cancellation::CancellationToken::new(),
+    )
+}
+
+pub fn command_histories_cancellable(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    limit: usize,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<CommandHistoryReport> {
+    let artifacts = scan_console_artifacts(image, kernel, profile, limit, false, cancellation)?;
     Ok(CommandHistoryReport {
         records: artifacts.histories,
         conhost_processes: artifacts.conhost_processes,
@@ -146,7 +164,23 @@ pub fn consoles(
     profile: &KernelProfile,
     limit: usize,
 ) -> Result<ConsoleReport> {
-    scan_console_artifacts(image, kernel, profile, limit, true)
+    consoles_cancellable(
+        image,
+        kernel,
+        profile,
+        limit,
+        &crate::cancellation::CancellationToken::new(),
+    )
+}
+
+pub fn consoles_cancellable(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    limit: usize,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<ConsoleReport> {
+    scan_console_artifacts(image, kernel, profile, limit, true, cancellation)
 }
 
 fn scan_console_artifacts(
@@ -155,8 +189,20 @@ fn scan_console_artifacts(
     profile: &KernelProfile,
     limit: usize,
     scan_console_info: bool,
+    cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<ConsoleReport> {
+    cancellation.check_cancelled()?;
     ensure!(limit > 0, "控制台结果数量上限必须大于零");
+    if kernel.is_x86_pae() {
+        return legacy::scan(
+            image,
+            kernel,
+            profile,
+            limit,
+            scan_console_info,
+            cancellation,
+        );
+    }
     let processes = list_processes(image, kernel, profile, 65_536)?;
     let conhosts = processes
         .processes
@@ -184,6 +230,7 @@ fn scan_console_artifacts(
         return Ok(report);
     }
     for process in conhosts {
+        cancellation.check_cancelled()?;
         if report.histories.len() == limit {
             report.complete = false;
             report
@@ -208,6 +255,7 @@ fn scan_console_artifacts(
             report.missing_bytes
         ));
     }
+    cancellation.check_cancelled()?;
     Ok(report)
 }
 

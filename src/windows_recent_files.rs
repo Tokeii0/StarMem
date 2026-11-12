@@ -788,6 +788,10 @@ mod tests {
 
     fn key(path: &str, name: &str, last_write_raw: u64) -> RegistryPrintRecord {
         RegistryPrintRecord {
+            cmhive: None,
+            cell_index: 0,
+            key_cell_index: 0,
+            key_identity: None,
             depth: 0,
             kind: "key".to_owned(),
             path: path.to_owned(),
@@ -807,6 +811,10 @@ mod tests {
         last_write_raw: u64,
     ) -> RegistryPrintRecord {
         RegistryPrintRecord {
+            cmhive: None,
+            cell_index: 0,
+            key_cell_index: 0,
+            key_identity: None,
             depth: 1,
             kind: "value".to_owned(),
             path: path.to_owned(),
@@ -826,6 +834,10 @@ mod tests {
         last_write_raw: u64,
     ) -> RegistryPrintRecord {
         RegistryPrintRecord {
+            cmhive: None,
+            cell_index: 0,
+            key_cell_index: 0,
+            key_identity: None,
             depth: 1,
             kind: "value".to_owned(),
             path: path.to_owned(),

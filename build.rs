@@ -41,7 +41,10 @@ fn main() {
     };
 
     println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=Cargo.toml.orig");
+    // 源码快照可能没有 Cargo.toml.orig；监听不存在的文件会导致每次构建都失效。
+    if original_manifest.is_file() {
+        println!("cargo:rerun-if-changed=Cargo.toml.orig");
+    }
     println!("cargo:rerun-if-changed={}", crate_lock.display());
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=benchmarks/command-equivalence.json");

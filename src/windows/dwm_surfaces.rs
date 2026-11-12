@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::WindowsKernelContext;
 use super::list_processes;
@@ -534,6 +535,31 @@ pub fn recover_dwm_surfaces(
     force: bool,
     cancellation: &CancellationToken,
 ) -> Result<DwmSurfaceReport> {
+    recover_dwm_surfaces_in_session(
+        image,
+        kernel,
+        profile,
+        symbol_store,
+        output,
+        max_dimension,
+        force,
+        None,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recover_dwm_surfaces_in_session(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    symbol_store: &SymbolStore,
+    output: &Path,
+    max_dimension: u32,
+    force: bool,
+    session_id: Option<u32>,
+    cancellation: &CancellationToken,
+) -> Result<DwmSurfaceReport> {
     let processes = list_processes(image, kernel, profile, 65_536)?;
     let mut report = DwmSurfaceReport {
         warnings: processes
@@ -564,6 +590,15 @@ pub fn recover_dwm_surfaces(
 
     for process in dwm_processes {
         cancellation.check_cancelled()?;
+        if session_id.is_some_and(|session| {
+            process
+                .details
+                .session_id
+                .or(process.details.token_session_id)
+                != Some(session)
+        }) {
+            continue;
+        }
         report.processes_examined += 1;
         let Some(dtb) = process
             .details
@@ -696,7 +731,7 @@ pub fn recover_dwm_surfaces(
 
         let observed_warp_vtable = space.read_u64(candidates[0].resource_address)?;
         let (warp_pdb, warp_resource_vtable) =
-            resolve_warp_pdb(image, symbol_store, warp_base, observed_warp_vtable)?;
+            resolve_warp_pdb(image, symbol_store, dtb, warp_base, observed_warp_vtable)?;
         let warp_method = exact_symbol_rva(&warp_pdb, WARP_GET_VIRTUAL_ADDRESS)?;
         let mut warp_code = [0u8; 160];
         space
@@ -774,8 +809,11 @@ pub fn recover_dwm_surfaces(
                 stride,
                 format: candidate.format,
                 recovered_bytes: stats.recovered_bytes,
-                total_bytes,
-                coverage_percent: percent(stats.recovered_bytes, total_bytes),
+                total_bytes: u64::from(candidate.width) * u64::from(candidate.height) * 4,
+                coverage_percent: percent(
+                    stats.recovered_bytes,
+                    u64::from(candidate.width) * u64::from(candidate.height) * 4,
+                ),
                 sampled_non_black_percent: percent(stats.non_black_samples, stats.samples),
                 output: frame_output,
             });
@@ -785,11 +823,10 @@ pub fn recover_dwm_surfaces(
     if report.frames.is_empty() {
         report.complete = false;
         report.warnings.push(
-            "没有导出像素级桌面帧；窗口几何布局仍可用，但本镜像可能未捕获 CPU 可读的 DWM/WARP 后备存储"
-                .to_owned(),
+            "没有导出像素级桌面帧；当前来源可能没有可读取的 DWM/WARP CPU 像素存储".to_owned(),
         );
     } else {
-        report.complete = report
+        report.complete &= report
             .frames
             .iter()
             .all(|frame| frame.recovered_bytes == frame.total_bytes);
@@ -865,8 +902,11 @@ fn recover_system_memory_frames(
                 stride,
                 format,
                 recovered_bytes: stats.recovered_bytes,
-                total_bytes,
-                coverage_percent: percent(stats.recovered_bytes, total_bytes),
+                total_bytes: u64::from(width) * u64::from(height) * 4,
+                coverage_percent: percent(
+                    stats.recovered_bytes,
+                    u64::from(width) * u64::from(height) * 4,
+                ),
                 sampled_non_black_percent: percent(stats.non_black_samples, stats.samples),
                 output: frame_output,
             });
@@ -940,6 +980,10 @@ fn resolve_virtual_module_pdb(
         );
         return store.resolve(&record);
     }
+    ensure!(
+        !image.is_live(),
+        "实时模块 {pdb_name} 的 CodeView 无法直接验证，拒绝使用其他内存位置的符号指纹"
+    );
     let records = discover_codeview(image, pdb_name)?;
     ensure!(
         !records.is_empty(),
@@ -958,9 +1002,25 @@ fn resolve_virtual_module_pdb(
 fn resolve_warp_pdb(
     image: &MemoryImage,
     store: &SymbolStore,
+    dtb: u64,
     module_base: u64,
     observed_vtable: u64,
 ) -> Result<(PathBuf, u64)> {
+    if image.is_live() {
+        let record = codeview_from_virtual_pe(image, dtb, module_base)
+            .context("实时 WARP 模块的 CodeView 无法直接验证")?;
+        ensure!(
+            record.pdb_name.eq_ignore_ascii_case("d3d10warp.pdb"),
+            "WARP 模块 PDB 名称不匹配"
+        );
+        let path = store.resolve(&record)?;
+        let runtime = module_base + u64::from(exact_symbol_rva(&path, WARP_RESOURCE_VTABLE)?);
+        ensure!(
+            runtime == observed_vtable,
+            "WARP 精确符号与当前资源类型不匹配"
+        );
+        return Ok((path, runtime));
+    }
     let records = discover_codeview(image, "d3d10warp.pdb")?;
     ensure!(
         !records.is_empty(),
@@ -1288,14 +1348,30 @@ fn locate_subresource_stride(
     Ok(None)
 }
 
-struct WriteStats {
-    recovered_bytes: u64,
-    samples: u64,
-    non_black_samples: u64,
+/// A range in the packed, top-down BMP pixel array (header excluded).
+/// `source` describes the first byte; missing ranges have no physical source.
+#[derive(Debug, Clone, Serialize)]
+pub struct PixelByteRange {
+    pub pixel_offset: u64,
+    pub virtual_address: u64,
+    pub physical_address: Option<u64>,
+    pub length: u64,
+    pub source: Option<crate::image::SourceLocation>,
+}
+
+pub(crate) struct WriteStats {
+    pub recovered_bytes: u64,
+    pub samples: u64,
+    pub non_black_samples: u64,
+    pub ranges: Vec<PixelByteRange>,
+    pub pixel_sha256: String,
+    pub recovered_sha256: String,
+    pub bgr_sha256: String,
+    pub output_sha256: String,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_bgra_bmp(
+pub(crate) fn write_bgra_bmp(
     image: &MemoryImage,
     space: &X64AddressSpace<'_>,
     pixels: u64,
@@ -1307,6 +1383,16 @@ fn write_bgra_bmp(
     require_non_black: bool,
     cancellation: &CancellationToken,
 ) -> Result<WriteStats> {
+    ensure!(
+        width > 0 && height > 0 && width <= i32::MAX as u32 && height <= i32::MAX as u32,
+        "无效的 BMP 尺寸"
+    );
+    let row_bytes = u64::from(width) * 4;
+    ensure!(u64::from(stride) >= row_bytes, "像素行步长小于行宽");
+    pixels
+        .checked_add(u64::from(height - 1) * u64::from(stride))
+        .and_then(|last| last.checked_add(row_bytes))
+        .context("像素地址溢出")?;
     let mut policy = OutputPolicy::new(force);
     for source in image.sources() {
         policy.protect_file("memory_image_or_sidecar", &source.path);
@@ -1336,7 +1422,18 @@ fn write_bgra_bmp(
             recovered_bytes: 0,
             samples: 0,
             non_black_samples: 0,
+            ranges: Vec::new(),
+            pixel_sha256: String::new(),
+            recovered_sha256: String::new(),
+            bgr_sha256: String::new(),
+            output_sha256: String::new(),
         };
+        let mut packed_hash = Sha256::new();
+        let mut recovered_hash = Sha256::new();
+        let mut bgr_hash = Sha256::new();
+        let mut output_hash = Sha256::new();
+        let mut has_non_black_pixels = false;
+        output_hash.update(header);
         for y in 0..height {
             cancellation.check_cancelled()?;
             row.fill(0);
@@ -1345,12 +1442,26 @@ fn write_bgra_bmp(
             while offset < row.len() {
                 let address = row_address + offset as u64;
                 let count = (0x1000 - (address as usize & 0xfff)).min(row.len() - offset);
-                if space
-                    .read_virtual(address, &mut row[offset..offset + count])
-                    .is_ok()
-                {
+                let physical = space.translate(address).ok().filter(|physical| {
+                    image
+                        .read_physical(*physical, &mut row[offset..offset + count])
+                        .is_ok()
+                });
+                if physical.is_some() {
                     stats.recovered_bytes += count as u64;
+                    recovered_hash.update(&row[offset..offset + count]);
+                } else {
+                    // A failed multi-step read may already have modified the
+                    // destination. Do not publish those unverified bytes.
+                    row[offset..offset + count].fill(0);
                 }
+                stats.ranges.push(PixelByteRange {
+                    pixel_offset: u64::from(y) * row_len as u64 + offset as u64,
+                    virtual_address: address,
+                    physical_address: physical,
+                    length: count as u64,
+                    source: physical.and_then(|pa| image.source_location(pa)),
+                });
                 offset += count;
             }
             if y % 32 == 0 {
@@ -1361,12 +1472,24 @@ fn write_bgra_bmp(
                     }
                 }
             }
+            packed_hash.update(&row);
+            output_hash.update(&row);
+            // X/alpha is deliberately excluded from the comparison hash only.
+            // The BMP and packed hash preserve all original fourth bytes.
+            for pixel in row.chunks_exact(4) {
+                bgr_hash.update(&pixel[..3]);
+                has_non_black_pixels |= pixel[..3] != [0, 0, 0];
+            }
             writer.write_all(&row)?;
         }
         writer.flush()?;
-        if require_non_black && (stats.recovered_bytes == 0 || stats.non_black_samples == 0) {
+        if require_non_black && (stats.recovered_bytes == 0 || !has_non_black_pixels) {
             return Err(EmptyDwmFrame.into());
         }
+        stats.pixel_sha256 = hex::encode(packed_hash.finalize());
+        stats.recovered_sha256 = hex::encode(recovered_hash.finalize());
+        stats.bgr_sha256 = hex::encode(bgr_hash.finalize());
+        stats.output_sha256 = hex::encode(output_hash.finalize());
         completed_stats = Some(stats);
         Ok(())
     })?;
@@ -1410,6 +1533,73 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn bmp_counts_only_pixels_and_marks_missing_pages_black() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "starmem-dwm-pixels-{}-{nonce}.raw",
+            std::process::id()
+        ));
+        let output = path.with_extension("bmp");
+        let partial = path.with_extension("partial.bmp");
+        let sparse = path.with_extension("sparse.bmp");
+        let mut bytes = vec![0u8; 0x6000];
+        for (at, entry) in [
+            (0x1000, 0x2003u64),
+            (0x2000, 0x3003),
+            (0x3000, 0x4003),
+            (0x4008, 0x5003),
+        ] {
+            bytes[at..at + 8].copy_from_slice(&entry.to_le_bytes());
+        }
+        bytes[0x5000..0x5008].fill(11);
+        bytes[0x5008..0x5010].fill(99); // Row padding must not enter the BMP.
+        bytes[0x5010..0x5018].fill(22);
+        bytes[0x5ffc..0x6000].fill(33);
+        bytes[0x510c..0x5110].fill(55); // Content outside the legacy 32x32 sample grid.
+        fs::write(&path, bytes).unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let space = X64AddressSpace::new(&image, 0x1000).unwrap();
+        let token = CancellationToken::new();
+        let stats = write_bgra_bmp(
+            &image, &space, 0x1000, 2, 2, 16, &output, false, true, &token,
+        )
+        .unwrap();
+        assert_eq!(stats.recovered_bytes, 16);
+        let bmp = fs::read(&output).unwrap();
+        assert_eq!(bmp.len(), 54 + 16);
+        assert_eq!(&bmp[54..62], &[11; 8]);
+        assert_eq!(&bmp[62..70], &[22; 8]);
+        let stats = write_bgra_bmp(
+            &image, &space, 0x1ffc, 2, 1, 8, &partial, false, true, &token,
+        )
+        .unwrap();
+        assert_eq!(stats.recovered_bytes, 4);
+        assert_eq!(stats.ranges.len(), 2);
+        assert_eq!(stats.ranges[0].physical_address, Some(0x5ffc));
+        assert_eq!(stats.ranges[1].physical_address, None);
+        assert_eq!(stats.ranges[1].pixel_offset, 4);
+        assert_eq!(stats.ranges[1].length, 4);
+        assert_ne!(stats.pixel_sha256, stats.recovered_sha256);
+        assert_eq!(
+            &fs::read(&partial).unwrap()[54..],
+            &[33, 33, 33, 33, 0, 0, 0, 0]
+        );
+        let stats = write_bgra_bmp(
+            &image, &space, 0x1100, 2, 2, 8, &sparse, false, true, &token,
+        )
+        .unwrap();
+        assert_eq!(stats.non_black_samples, 0);
+        assert_eq!(&fs::read(&sparse).unwrap()[66..70], &[55; 4]);
+        drop(image);
+        for file in [output, partial, sparse, path] {
+            fs::remove_file(file).unwrap();
+        }
+    }
 
     #[test]
     fn derives_current_d3d11_handle_offset() {

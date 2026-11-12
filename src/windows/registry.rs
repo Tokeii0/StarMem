@@ -4,6 +4,7 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use anyhow::{Context, Result, ensure};
 
 use super::WindowsKernelContext;
+use super::compressed_store::{CompressedPageEvidence, CompressedStore};
 use super::files::{DumpFileReport, DumpSource, RecoveredExtent, recover_file_bytes};
 use super::plugins::resolve_system_handle_object;
 use crate::address::X64AddressSpace;
@@ -25,6 +26,68 @@ struct HiveRecovery {
     complete: bool,
     extents: Vec<RecoveredExtent>,
     warnings: Vec<String>,
+    compressed_pages: Vec<CompressedPageEvidence>,
+}
+
+/// Initialize the store only after a resident hive page read has failed. The
+/// context belongs to this recovery/image and never survives a session switch.
+struct HiveCompression<'a> {
+    image: &'a MemoryImage,
+    kernel: &'a WindowsKernelContext,
+    profile: &'a KernelProfile,
+    store: Option<Result<CompressedStore<'a>, String>>,
+    pages: Vec<CompressedPageEvidence>,
+    failures: u64,
+    details: Vec<String>,
+}
+
+impl HiveCompression<'_> {
+    fn read_page(
+        &mut self,
+        kernel_space: &X64AddressSpace<'_>,
+        registry_space: Option<&X64AddressSpace<'_>>,
+        address: u64,
+        output: &mut [u8],
+        file_offset: u64,
+    ) -> Option<&'static str> {
+        if let Some(kind) = read_mapped_page(kernel_space, registry_space, address, output) {
+            return Some(kind);
+        }
+        let initialized = self.store.get_or_insert_with(|| {
+            CompressedStore::new(self.image, self.kernel, self.profile)
+                .map_err(|error| format!("{error:#}"))
+        });
+        let mut failure = None;
+        match initialized {
+            Ok(store) => {
+                let spaces = if is_kernel_address(address) {
+                    [Some(kernel_space), registry_space]
+                } else {
+                    [registry_space, Some(kernel_space)]
+                };
+                for space in spaces.into_iter().flatten() {
+                    match store.recover_page(space, address, file_offset) {
+                        Ok((page, evidence)) if output.len() == page.len() => {
+                            output.copy_from_slice(&page);
+                            self.pages.push(evidence);
+                            return Some("compressed_store_virtual");
+                        }
+                        Ok(_) => failure = Some("compressed page output size mismatch".to_owned()),
+                        Err(error) => failure = Some(format!("{error:#}")),
+                    }
+                }
+            }
+            Err(error) => failure = Some(error.clone()),
+        }
+        self.failures += 1;
+        if self.details.len() < 3 {
+            self.details.push(format!(
+                "Hive 偏移 {file_offset:#x} / VA {address:#x}：{}",
+                failure.as_deref().unwrap_or("压缩页面读取失败")
+            ));
+        }
+        None
+    }
 }
 
 struct HiveFileSource {
@@ -119,6 +182,15 @@ fn recover_hive_to<W: Write + Seek>(
         .filter(|dtb| *dtb != 0)
         .map(|dtb| X64AddressSpace::new(image, dtb))
         .transpose()?;
+    let mut compression = HiveCompression {
+        image,
+        kernel,
+        profile,
+        store: None,
+        pages: Vec::new(),
+        failures: 0,
+        details: Vec::new(),
+    };
 
     let hive_offset = profile.type_field("_CMHIVE", "Hive")?.offset;
     let hhive = cmhive
@@ -136,11 +208,12 @@ fn recover_hive_to<W: Write + Seek>(
     let (mut base_page_kind, base_page_issue) = if base_block == 0 {
         (None, Some("HHIVE 的 BaseBlock 指针为空".to_owned()))
     } else {
-        match read_mapped_page(
+        match compression.read_page(
             &kernel_space,
             registry_space.as_ref(),
             base_block,
             &mut base_page,
+            0,
         ) {
             Some(kind) if &base_page[..4] == b"regf" => (Some(kind), None),
             Some(_) => (None, Some("Hive 基础块没有 regf 签名".to_owned())),
@@ -248,11 +321,12 @@ fn recover_hive_to<W: Write + Seek>(
                 continue;
             };
             let mut page = vec![0u8; PAGE_SIZE as usize];
-            if let Some(memory_kind) = read_mapped_page(
+            if let Some(memory_kind) = compression.read_page(
                 &kernel_space,
                 registry_space.as_ref(),
                 memory_address,
                 &mut page,
+                PAGE_SIZE + store_offset,
             ) {
                 recovered_page = Some((page, memory_address, memory_kind));
                 break;
@@ -373,6 +447,19 @@ fn recover_hive_to<W: Write + Seek>(
     }
     let missing_pages = missing_store_offsets.len() as u64;
     let mut warnings = fallback_warnings;
+    if !compression.pages.is_empty() {
+        warnings.push(format!(
+            "已沿 HMAP / 软件 PTE / Windows 压缩存储补回 {} 个 Hive 页面；恢复范围标记为 compressed_store_virtual，dump-registry 导出报告可按 CMHIVE 查看逐页来源与解压校验值（compressed_pages）",
+            compression.pages.len()
+        ));
+    }
+    if compression.failures > 0 {
+        warnings.push(format!(
+            "{} 次 Hive 页面压缩存储恢复未成功；{}",
+            compression.failures,
+            compression.details.join("；")
+        ));
+    }
     if base_page_kind.is_some() {
         let base_length = u64::from(u32::from_le_bytes(base_page[40..44].try_into()?));
         if base_length != stable_length {
@@ -415,7 +502,7 @@ fn recover_hive_to<W: Write + Seek>(
     }
     if missing_pages > 0 {
         warnings.push(format!(
-            "采集的地址空间中有 {missing_pages} 个稳定存储 Hive 页面不驻留"
+            "驻留页面、压缩存储及 backing FILE_OBJECT 恢复后，仍有 {missing_pages} 个稳定存储 Hive 页面不可读取"
         ));
     }
     let extents = normalize_extents(extents);
@@ -429,6 +516,7 @@ fn recover_hive_to<W: Write + Seek>(
         complete: recovered_bytes == logical_size && backing_pages == 0,
         extents,
         warnings,
+        compressed_pages: compression.pages,
     })
 }
 
@@ -639,7 +727,7 @@ fn synthesize_base_block(stable_length: u64, root_cell: u32) -> Result<Vec<u8>> 
     Ok(base)
 }
 
-fn validate_backing_base_block(base: &[u8], stable_length: u64) -> Result<()> {
+pub(crate) fn validate_backing_base_block(base: &[u8], stable_length: u64) -> Result<()> {
     ensure!(base.len() >= PAGE_SIZE as usize, "Hive 基础块被截断");
     ensure!(&base[..4] == b"regf", "Hive 基础块没有 regf 签名");
     let sequence1 = u32::from_le_bytes(base[4..8].try_into()?);
@@ -703,6 +791,7 @@ impl HiveRecovery {
             complete: self.complete,
             extents: self.extents,
             warnings: self.warnings,
+            compressed_pages: self.compressed_pages,
         }
     }
 }

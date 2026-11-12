@@ -28,6 +28,8 @@ use crate::image::MemoryImage;
 use crate::output_policy::{OutputPolicy, OutputTarget};
 use crate::symbols::SymbolStore;
 
+pub(crate) mod system_map;
+
 const MAX_ISF_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ISF_FILES: usize = 100_000;
 const MAX_DISCOVERY_WARNINGS: usize = 16;
@@ -63,6 +65,7 @@ const TASK_RETAINED_TYPES: &[&str] = &[
     "radix_tree_node",
     "hlist_head",
     "hlist_node",
+    "fs_struct",
 ];
 const TASK_SYMBOLS: &[&str] = &["init_task"];
 const TASK_FIELDS: &[LinuxSymbolFieldRequirement] = &[
@@ -86,6 +89,7 @@ const VFS_TYPES: &[&str] = &[
 ];
 const VFS_RETAINED_TYPES: &[&str] = &[
     "radix_tree_root",
+    "radix_tree_node",
     "xarray",
     "page",
     "folio",
@@ -120,8 +124,6 @@ const NETWORK_TYPES: &[&str] = &[
     "sockaddr_un",
     "nsproxy",
     "net",
-    "ns_common",
-    "possible_net_t",
 ];
 const NETWORK_FIELDS: &[LinuxSymbolFieldRequirement] = &[
     LinuxSymbolFieldRequirement::one("file", &["private_data"]),
@@ -131,7 +133,7 @@ const NETWORK_FIELDS: &[LinuxSymbolFieldRequirement] = &[
     LinuxSymbolFieldRequirement::one("nsproxy", &["net_ns"]),
 ];
 
-const MODULE_TYPES: &[&str] = &["list_head", "module", "module_layout"];
+const MODULE_TYPES: &[&str] = &["list_head", "module"];
 const MODULE_RETAINED_TYPES: &[&str] = &["module_kobject", "kobject", "kset"];
 const MODULE_SYMBOLS: &[&str] = &["modules"];
 const MODULE_RETAINED_SYMBOLS: &[&str] = &[
@@ -1282,6 +1284,46 @@ impl LinuxIsf {
     }
 
     fn field<'a>(&'a self, type_name: &str, field_name: &str) -> Result<Option<ResolvedField<'a>>> {
+        // Named embedded structures/unions are not anonymous C members. Resolve
+        // explicit paths (for example d_u.d_child or ns.inum) without searching
+        // unrelated named members or following pointers.
+        if let Some((parent, child)) = field_name.split_once('.') {
+            let Some(parent) = self.field(type_name, parent)? else {
+                return Ok(None);
+            };
+            ensure!(
+                matches!(parent.kind.kind.as_str(), "struct" | "union"),
+                "ISF 字段路径 {type_name}.{field_name} 的中间成员不是内嵌结构"
+            );
+            let nested = parent
+                .kind
+                .name
+                .as_deref()
+                .context("ISF 内嵌结构没有类型名")?;
+            let Some(child) = self.field(nested, child)? else {
+                return Ok(None);
+            };
+            let end = child
+                .offset
+                .checked_add(self.type_ref_size(child.kind)?)
+                .context("ISF 内嵌字段范围溢出")?;
+            ensure!(end <= self.type_size(nested)?, "ISF 内嵌字段超出结构范围");
+            let offset = parent
+                .offset
+                .checked_add(child.offset)
+                .context("ISF 字段路径偏移溢出")?;
+            ensure!(
+                parent
+                    .offset
+                    .checked_add(end)
+                    .is_some_and(|end| self.type_size(type_name).is_ok_and(|size| end <= size)),
+                "ISF 字段路径超出外层结构范围"
+            );
+            return Ok(Some(ResolvedField {
+                offset,
+                kind: child.kind,
+            }));
+        }
         let mut matches = Vec::new();
         let mut stack = HashSet::new();
         self.collect_fields(type_name, field_name, 0, &mut stack, &mut matches)?;
@@ -1455,7 +1497,7 @@ impl LinuxIsf {
 
         let mut retained_names = BTreeSet::new();
         for root in retained_type_names(&features) {
-            collect_anonymous_types(&document.user_types, root, &mut retained_names);
+            collect_embedded_types(&document.user_types, root, &mut retained_names);
         }
         let retained_symbols = retained_symbol_names(&features);
         if features.contains(&LinuxSymbolFeature::IncidentResponse) {
@@ -1467,7 +1509,7 @@ impl LinuxIsf {
                         .filter(|kind| matches!(kind.kind.as_str(), "struct" | "union"))
                     && let Some(name) = kind.name.as_deref()
                 {
-                    collect_anonymous_types(&document.user_types, name, &mut retained_names);
+                    collect_embedded_types(&document.user_types, name, &mut retained_names);
                 }
             }
         }
@@ -2143,6 +2185,23 @@ pub fn resolve_linux_isf_for_features(
     features: impl IntoIterator<Item = LinuxSymbolFeature>,
 ) -> Result<LinuxIsfResolution> {
     let features = normalize_features(features);
+    ensure!(
+        store.linux_system_map().is_none(),
+        "此操作需要完整 Linux ISF；System.map 仅包含地址，不能作为 ISF 类型表使用"
+    );
+    if let Some(path) = store.linux_isf() {
+        let table = load_linux_isf_for_features(path, features.iter().copied())?;
+        ensure!(
+            image_banners.iter().any(|banner| banner == table.banner()),
+            "用户指定的 Linux ISF 与镜像完整 linux_banner 不匹配：{}；请重新选择符号文件或使用自动判断",
+            path.display()
+        );
+        return Ok(LinuxIsfResolution {
+            table: Some(Arc::new(table)),
+            warnings: Vec::new(),
+            files_considered: 1,
+        });
+    }
     let roots = linux_symbol_roots(store);
     let mut paths = Vec::new();
     let mut seen_paths = HashSet::new();
@@ -2843,8 +2902,23 @@ fn load_linux_isf_from_storage(
     features: impl IntoIterator<Item = LinuxSymbolFeature>,
 ) -> Result<LinuxIsf> {
     let features = normalize_features(features);
-    let source = fs::read(storage_path)
-        .with_context(|| format!("无法读取 Volatility 3 ISF {}", storage_path.display()))?;
+    let (json, file_sha256) = read_linux_isf_json(storage_path, format_path)?;
+    let document: IsfDocument = serde_json::from_slice(&json)
+        .with_context(|| format!("Volatility 3 ISF JSON 无效：{}", storage_path.display()))?;
+    LinuxIsf::from_document_with_features(
+        format_path.to_path_buf(),
+        file_sha256,
+        document,
+        features,
+    )
+}
+
+fn read_linux_isf_json(storage_path: &Path, format_path: &Path) -> Result<(Vec<u8>, String)> {
+    let mut source = Vec::new();
+    File::open(storage_path)
+        .with_context(|| format!("无法读取 Volatility 3 ISF {}", storage_path.display()))?
+        .take(MAX_ISF_BYTES + 1)
+        .read_to_end(&mut source)?;
     ensure!(
         source.len() as u64 <= MAX_ISF_BYTES,
         "Volatility 3 ISF 文件超过 {} MiB 安全上限",
@@ -2872,17 +2946,10 @@ fn load_linux_isf_from_storage(
     } else {
         source
     };
-    let document: IsfDocument = serde_json::from_slice(&json)
-        .with_context(|| format!("Volatility 3 ISF JSON 无效：{}", storage_path.display()))?;
-    LinuxIsf::from_document_with_features(
-        format_path.to_path_buf(),
-        file_sha256,
-        document,
-        features,
-    )
+    Ok((json, file_sha256))
 }
 
-fn collect_anonymous_types(
+fn collect_embedded_types(
     types: &BTreeMap<String, IsfUserType>,
     name: &str,
     output: &mut BTreeSet<String>,
@@ -2893,9 +2960,13 @@ fn collect_anonymous_types(
     let Some(kind) = types.get(name) else {
         return;
     };
-    for field in kind.fields.values().filter(|field| field.anonymous) {
+    for field in kind
+        .fields
+        .values()
+        .filter(|field| matches!(field.kind.kind.as_str(), "struct" | "union"))
+    {
         if let Some(nested) = field.kind.name.as_deref() {
-            collect_anonymous_types(types, nested, output);
+            collect_embedded_types(types, nested, output);
         }
     }
 }
@@ -3091,6 +3162,27 @@ impl IsfInteger {
 }
 
 #[cfg(test)]
+pub(crate) fn test_isf(user_types: serde_json::Value) -> LinuxIsf {
+    let document = serde_json::json!({
+        "metadata": { "format": "6.2.0" },
+        "base_types": { "long unsigned int": { "size": 8 }, "unsigned int": { "size": 4 } },
+        "user_types": user_types,
+        "symbols": {
+            "_stext": { "address": 0xffff_ffff_8100_0000u64 },
+            "linux_banner": { "address": 0xffff_ffff_8120_0000u64,
+                "constant_data": BASE64_STANDARD.encode(b"Linux version 3.10.0-test #1 SMP\n\0") }
+        }
+    });
+    let bytes = serde_json::to_vec(&document).unwrap();
+    LinuxIsf::from_document(
+        PathBuf::from("synthetic-linux-layout.json"),
+        sha256_hex(&bytes),
+        serde_json::from_value(document).unwrap(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -3237,6 +3329,69 @@ mod tests {
     }
 
     #[test]
+    fn named_embedded_fields_survive_compaction_without_implicit_pointer_dereference() {
+        let mut types = serde_json::json!({
+            "dentry": { "size": 192, "fields": {
+                "d_u": { "offset": 144, "type": { "kind": "union", "name": "dentry_union" } },
+                "d_subdirs": { "offset": 160, "type": { "kind": "struct", "name": "list_head" } },
+                "d_parent": { "offset": 24, "type": { "kind": "pointer", "subtype": { "kind": "struct", "name": "dentry" } } }
+            } },
+            "dentry_union": { "size": 16, "fields": {
+                "d_child": { "offset": 0, "type": { "kind": "struct", "name": "list_head" } }
+            } },
+            "list_head": { "size": 16, "fields": {} },
+            "unrelated": { "size": 8, "fields": {} }
+        });
+        let table = test_isf(types.clone());
+        assert_eq!(table.field_offset("dentry", "d_u.d_child").unwrap(), 144);
+        assert_eq!(table.field_size("dentry", "d_u.d_child").unwrap(), 16);
+        assert_eq!(
+            table.optional_field_offset("dentry", "d_child").unwrap(),
+            None
+        );
+        assert!(table.field_offset("dentry", "d_parent.d_subdirs").is_err());
+        assert!(table.type_size("unrelated").is_err());
+        types["dentry_union"]["fields"]["d_child"]["offset"] = 8.into();
+        assert!(
+            test_isf(types)
+                .field_offset("dentry", "d_u.d_child")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_modules_do_not_require_module_layout_type() {
+        let mut document: serde_json::Value = serde_json::from_str(&synthetic_module_document(
+            "Linux version 3.10.0-test #1 SMP",
+            128,
+        ))
+        .unwrap();
+        document["user_types"]
+            .as_object_mut()
+            .unwrap()
+            .remove("module_layout");
+        let fields = document["user_types"]["module"]["fields"]
+            .as_object_mut()
+            .unwrap();
+        fields.remove("core_layout");
+        fields.insert(
+            "module_core".into(),
+            serde_json::json!({"offset": 96,
+            "type": {"kind": "pointer", "subtype": {"kind": "base", "name": "void"}}}),
+        );
+        let table = LinuxIsf::from_document(
+            PathBuf::from("legacy-module.json"),
+            "fixture".into(),
+            serde_json::from_value(document).unwrap(),
+        )
+        .unwrap();
+        let gaps = table.requirement_gaps_for(&BTreeSet::from([LinuxSymbolFeature::Modules]));
+        assert!(gaps.missing_types.is_empty(), "{gaps:?}");
+        assert!(gaps.missing_fields.is_empty(), "{gaps:?}");
+        assert!(gaps.missing_symbols.is_empty(), "{gaps:?}");
+    }
+
+    #[test]
     fn feature_registry_is_complete_and_unique() {
         let features = linux_symbol_feature_registry()
             .iter()
@@ -3332,6 +3487,67 @@ mod tests {
             ..Default::default()
         };
         assert!(refresh_offline.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_linux_isf_overrides_conflicting_search_roots_and_rejects_mismatch() {
+        let root = env::temp_dir().join(format!(
+            "starmem-explicit-isf-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let banner = "Linux version 6.8.0-explicit-test #1 SMP";
+        let chosen = root.join("chosen.json");
+        let other = root.join("other.json");
+        fs::write(&chosen, synthetic_module_document(banner, 64)).unwrap();
+        fs::write(&other, synthetic_module_document(banner, 128)).unwrap();
+        let store = SymbolStore::new(root.join("cache"))
+            .with_search_root(root.clone())
+            .with_linux_isf(chosen.clone());
+        let resolved =
+            resolve_linux_isf_for_features(&store, &[banner.into()], [LinuxSymbolFeature::Modules])
+                .unwrap();
+        assert_eq!(resolved.files_considered, 1);
+        assert_eq!(resolved.table.unwrap().path(), chosen);
+        let mismatch = resolve_linux_isf_for_features(
+            &store,
+            &["Linux version wrong".into()],
+            [LinuxSymbolFeature::Modules],
+        );
+        assert!(mismatch.unwrap_err().to_string().contains("不匹配"));
+        fs::write(&chosen, b"invalid").unwrap();
+        assert!(
+            resolve_linux_isf_for_features(&store, &[banner.into()], [LinuxSymbolFeature::Modules])
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_linux_isf_accepts_compressed_input() {
+        let root = env::temp_dir().join(format!(
+            "starmem-explicit-isf-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let banner = "Linux version 6.8.0-explicit-xz #1 SMP";
+        let chosen = root.join("符号 文件.json.xz");
+        let mut writer =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+        std::io::Write::write_all(
+            &mut writer,
+            synthetic_module_document(banner, 64).as_bytes(),
+        )
+        .unwrap();
+        fs::write(&chosen, writer.finish().unwrap()).unwrap();
+        let store = SymbolStore::new(root.join("cache")).with_linux_isf(chosen.clone());
+        let resolved =
+            resolve_linux_isf_for_features(&store, &[banner.into()], [LinuxSymbolFeature::Modules])
+                .unwrap();
+        assert_eq!(resolved.table.unwrap().path(), chosen);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

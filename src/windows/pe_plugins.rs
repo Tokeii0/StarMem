@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::plugins::{list_drivers, list_vads};
 use super::{ProcessRecord, WindowsKernelContext, list_processes, read_unicode_string};
-use crate::address::X64AddressSpace;
+use crate::address::{WindowsAddressSpace, X64AddressSpace};
 use crate::image::MemoryImage;
 use crate::output_policy::{OutputPolicy, OutputTarget};
 use crate::profile::KernelProfile;
@@ -163,7 +163,7 @@ pub fn ldr_modules(
         .filter(|process| pid_filter.is_none_or(|pid| process.pid == pid))
     {
         processes_examined += 1;
-        let Some(space) = process_address_space(image, process) else {
+        let Some(space) = process_x64_address_space(image, kernel, process) else {
             complete = false;
             push_warning_limited(
                 &mut warnings,
@@ -296,7 +296,7 @@ pub fn list_iat(
             );
             continue;
         };
-        let Some(space) = process_address_space(image, process) else {
+        let Some(space) = process_address_space(image, kernel, process) else {
             complete = false;
             continue;
         };
@@ -428,7 +428,7 @@ pub fn pe_symbols(
             let modules = list_drivers(image, kernel, profile, 65_536)?;
             warnings.extend(modules.warnings);
             complete &= modules.complete;
-            let space = kernel.x64_address_space(image)?;
+            let space = kernel.address_space(image)?;
             for module in modules
                 .records
                 .iter()
@@ -495,7 +495,7 @@ pub fn pe_symbols(
                 let Some(process) = process_map.get(&module.pid) else {
                     continue;
                 };
-                let Some(space) = process_address_space(image, process) else {
+                let Some(space) = process_address_space(image, kernel, process) else {
                     complete = false;
                     continue;
                 };
@@ -586,7 +586,7 @@ pub fn dump_pe(
     output_policy.preflight()?;
 
     let (space, process_name) = if kernel_module {
-        (kernel.x64_address_space(image)?, "Kernel".to_owned())
+        (kernel.address_space(image)?, "Kernel".to_owned())
     } else {
         let wanted_pid = pid.expect("validated above");
         let processes = list_processes(image, kernel, profile, 65_536)?;
@@ -596,7 +596,7 @@ pub fn dump_pe(
             .find(|process| process.pid == wanted_pid)
             .with_context(|| format!("PID {wanted_pid} 不是活动进程"))?;
         (
-            process_address_space(image, process)
+            process_address_space(image, kernel, process)
                 .with_context(|| format!("PID {wanted_pid} 没有可读的页表"))?,
             process.name.clone(),
         )
@@ -795,7 +795,10 @@ pub(crate) struct ExportSymbol {
     pub(crate) forwarder: Option<String>,
 }
 
-pub(crate) fn read_pe_exports(space: &X64AddressSpace<'_>, base: u64) -> Result<Vec<ExportSymbol>> {
+pub(crate) fn read_pe_exports(
+    space: &WindowsAddressSpace<'_>,
+    base: u64,
+) -> Result<Vec<ExportSymbol>> {
     let headers = read_pe_headers(space, base)?;
     if headers.export_rva == 0 || headers.export_size == 0 {
         return Ok(Vec::new());
@@ -866,7 +869,7 @@ pub(crate) fn read_pe_exports(space: &X64AddressSpace<'_>, base: u64) -> Result<
     Ok(output)
 }
 
-fn read_pe_layout(space: &X64AddressSpace<'_>, base: u64) -> Result<PeLayout> {
+fn read_pe_layout(space: &WindowsAddressSpace<'_>, base: u64) -> Result<PeLayout> {
     let mut dos = [0u8; 0x40];
     space.read_virtual(base, &mut dos)?;
     ensure!(&dos[..2] == b"MZ", "缺少 DOS 签名");
@@ -921,7 +924,7 @@ fn read_pe_layout(space: &X64AddressSpace<'_>, base: u64) -> Result<PeLayout> {
 }
 
 fn recover_virtual_range(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     file: &mut File,
     source: u64,
     destination: u64,
@@ -948,7 +951,7 @@ fn recover_virtual_range(
 }
 
 fn read_virtual_vector(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     address: u64,
     length: usize,
 ) -> Result<Vec<u8>> {
@@ -973,7 +976,7 @@ fn symbol_matches(name: Option<&str>, filter: Option<&str>) -> bool {
     filter.is_none_or(|wanted| name.is_some_and(|name| name.eq_ignore_ascii_case(wanted)))
 }
 
-fn read_pe_headers(space: &X64AddressSpace<'_>, base: u64) -> Result<PeHeaders> {
+fn read_pe_headers(space: &WindowsAddressSpace<'_>, base: u64) -> Result<PeHeaders> {
     let mut dos = [0u8; 0x40];
     space.read_virtual(base, &mut dos)?;
     ensure!(&dos[..2] == b"MZ", "缺少 DOS 签名");
@@ -1001,8 +1004,24 @@ fn read_pe_headers(space: &X64AddressSpace<'_>, base: u64) -> Result<PeHeaders> 
 
 fn process_address_space<'a>(
     image: &'a MemoryImage,
+    kernel: &WindowsKernelContext,
+    process: &ProcessRecord,
+) -> Option<WindowsAddressSpace<'a>> {
+    process
+        .details
+        .user_directory_table_base
+        .or(process.details.directory_table_base)
+        .and_then(|dtb| kernel.address_space_for_dtb(image, dtb).ok())
+}
+
+fn process_x64_address_space<'a>(
+    image: &'a MemoryImage,
+    kernel: &WindowsKernelContext,
     process: &ProcessRecord,
 ) -> Option<X64AddressSpace<'a>> {
+    if kernel.is_x86_pae() {
+        return None;
+    }
     process
         .details
         .user_directory_table_base
@@ -1010,7 +1029,7 @@ fn process_address_space<'a>(
         .and_then(|dtb| X64AddressSpace::new(image, dtb).ok())
 }
 
-fn read_pointer(space: &X64AddressSpace<'_>, address: u64, size: u64) -> Option<u64> {
+fn read_pointer(space: &WindowsAddressSpace<'_>, address: u64, size: u64) -> Option<u64> {
     match size {
         8 => space.read_u64(address).ok(),
         4 => {
@@ -1022,13 +1041,13 @@ fn read_pointer(space: &X64AddressSpace<'_>, address: u64, size: u64) -> Option<
     }
 }
 
-fn read_u16_at(space: &X64AddressSpace<'_>, address: u64) -> Option<u16> {
+fn read_u16_at(space: &WindowsAddressSpace<'_>, address: u64) -> Option<u16> {
     let mut bytes = [0u8; 2];
     space.read_virtual(address, &mut bytes).ok()?;
     Some(u16::from_le_bytes(bytes))
 }
 
-fn read_ascii_z(space: &X64AddressSpace<'_>, address: u64, max: usize) -> Option<String> {
+fn read_ascii_z(space: &WindowsAddressSpace<'_>, address: u64, max: usize) -> Option<String> {
     let mut output = Vec::new();
     let mut current = address;
     while output.len() < max {

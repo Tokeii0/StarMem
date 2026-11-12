@@ -21,6 +21,8 @@ use crate::linux::{
 };
 use crate::output_policy::{OutputPolicy, OutputTarget};
 
+pub mod strings;
+
 const PAGE_SIZE: u64 = 0x1000;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_8000_0000_0000;
 const MAX_DENTRY_NAME: usize = 255;
@@ -534,6 +536,10 @@ fn process_list_warnings(report: &LinuxProcessListReport) -> Vec<LinuxProcessArt
 }
 
 fn exact_profile(kernel: &LinuxKernelContext) -> Result<ExactLinuxProcessProfile> {
+    ensure!(
+        kernel.system_map.is_none() || kernel.symbol_table.is_some(),
+        "System.map 不包含进程地址空间类型；自动补齐尚未找到匹配的 Linux ISF"
+    );
     if let Some(isf) = kernel.symbol_table.as_deref() {
         return ExactLinuxProcessProfile::from_isf(isf).or_else(|isf_error| {
             ExactLinuxProcessProfile::for_banner(&kernel.banner).with_context(|| {
@@ -763,6 +769,12 @@ pub fn analyze_psaux(
     let mut complete = processes.complete;
     for process in selected {
         let cmdline = cmdlines.remove(&process.task);
+        let fallback_requested = cmdline.as_ref().map_or(0, |record| record.requested_bytes);
+        let fallback_recovered = cmdline.as_ref().map_or(0, |record| record.recovered_bytes);
+        let fallback_missing = cmdline
+            .as_ref()
+            .map(|record| record.missing_ranges.clone())
+            .unwrap_or_default();
         let is_kernel_thread = process.kernel_thread == Some(true);
         let (
             command_line,
@@ -823,9 +835,9 @@ pub fn analyze_psaux(
                 false,
                 0,
                 Vec::new(),
-                0,
-                0,
-                Vec::new(),
+                fallback_requested,
+                fallback_recovered,
+                fallback_missing,
             )
         };
         records.push(LinuxPsAuxRecord {
@@ -1593,6 +1605,44 @@ fn read_file_evidence(
         path,
         path_status,
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct LinuxProcessDirectory {
+    pub task: u64,
+    pub fs: u64,
+    pub mount: u64,
+    pub dentry: u64,
+    pub path: String,
+    pub path_semantics: &'static str,
+}
+
+/// Resolve task.fs.pwd using the exact ISF and the existing validated mount walk.
+pub fn process_current_directory(
+    image: &MemoryImage,
+    kernel: &LinuxKernelContext,
+    task: u64,
+) -> Result<LinuxProcessDirectory> {
+    let isf = kernel
+        .symbol_table
+        .as_deref()
+        .context("工作目录需要精确 Linux ISF")?;
+    let profile = exact_profile(kernel)?;
+    let space = LinuxX64AddressSpace::new(image, kernel.directory_table_base)?;
+    let fs = space.read_u64(task + isf.field_offset("task_struct", "fs")?)?;
+    ensure!(is_kernel_pointer(fs), "task_struct.fs 不可用");
+    let pwd = fs + isf.field_offset("fs_struct", "pwd")?;
+    let mount = space.read_u64(pwd + profile.path_mnt)?;
+    let dentry = space.read_u64(pwd + profile.path_dentry)?;
+    let path = resolve_mounted_path(&space, profile, mount, dentry)?;
+    Ok(LinuxProcessDirectory {
+        task,
+        fs,
+        mount,
+        dentry,
+        path,
+        path_semantics: "mount_namespace_root_relative; 未根据进程 chroot 裁剪",
+    })
 }
 
 fn resolve_mounted_path(
@@ -2424,6 +2474,7 @@ mod tests {
             task_struct_size: 0x1000,
             task_struct_offsets: BTreeMap::new(),
             symbol_table: None,
+            system_map: None,
         };
         let process = |pid, ppid, name: &str, mm| LinuxProcessRecord {
             task: 0xffff_8000_0000_0000 + pid as u64 * 0x1000,

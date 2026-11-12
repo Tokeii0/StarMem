@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +17,8 @@ use crate::scan::ScanEngine;
 
 #[path = "image_codec.rs"]
 mod codec;
+#[path = "image_dump_bitmap.rs"]
+mod dump_bitmap;
 #[path = "image_elf.rs"]
 mod elf;
 #[path = "image_vmware.rs"]
@@ -26,6 +30,10 @@ const DUMP_HEADER64_SIZE: u64 = 0x2000;
 const DEFAULT_DECODE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SNAPPY_MAPPING_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SNAPPY_MAPPING_ENCODED_BYTES: u64 = 512 * 1024 * 1024;
+// Bulk reads must not fault the entire image into the long-lived mapping. A
+// Windows uses positional reads; other platforms use short-lived bounded views.
+const BULK_READ_THRESHOLD: usize = 64 * 1024;
+const BULK_READ_WINDOW: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ImageOpenOptions {
@@ -222,7 +230,9 @@ pub struct WindowsDump64 {
     pub bug_check_code: u32,
     pub bug_check_parameters: [u64; 4],
     pub kd_debugger_data_block: u64,
+    /// Physical run-table count, or the number of contiguous runs decoded from a bitmap.
     pub number_of_runs: u32,
+    /// Pages actually stored in this dump, not the bitmap's physical address extent.
     pub number_of_pages: u64,
     pub dump_type: u32,
     pub required_dump_space: u64,
@@ -234,6 +244,18 @@ pub struct WindowsDump64 {
     pub product_type: u32,
     pub suite_mask: u32,
     pub writer_status: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitmap: Option<WindowsDumpBitmap64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowsDumpBitmap64 {
+    pub signature: String,
+    /// Absolute source-file offset of the packed physical pages.
+    pub header_size: u64,
+    pub present_pages: u64,
+    /// One bit per PFN; unset bits do not distinguish omitted RAM from physical holes.
+    pub bitmap_size: u64,
 }
 
 #[derive(Clone)]
@@ -251,8 +273,9 @@ pub struct MemoryImage {
 
 #[derive(Clone)]
 enum ImageBacking {
-    Mmap(Arc<Mmap>),
+    Mmap(Arc<Mmap>, Arc<File>),
     Ewf(Arc<EwfReader>),
+    LiveVmware(Arc<crate::live::LiveImageReader>),
 }
 
 #[derive(Clone)]
@@ -285,6 +308,56 @@ impl DecodeCache {
 }
 
 impl MemoryImage {
+    /// Crate-private bridge: only the live observer can construct this source.
+    /// No exact file offsets or borrowed bytes are available for live reads.
+    pub(crate) fn from_live_vmware(reader: Arc<crate::live::LiveImageReader>) -> Result<Self> {
+        let source = reader.source();
+        let length = source.region.length;
+        let base = source.region.host_address;
+        let path = PathBuf::from(format!("vmware-live-{}", source.session_id));
+        let spans = source
+            .physical_ranges
+            .iter()
+            .map(|range| PhysicalSpan {
+                start: range.physical_start,
+                length: range.length,
+                file_offset: range.host_start - base,
+                source_index: 0,
+                encoding: MappingEncoding::Direct,
+            })
+            .collect();
+        Self::from_parts(
+            path.clone(),
+            vec![ImageSource {
+                info: ImageSourceInfo {
+                    index: 0,
+                    path,
+                    role: ImageSourceRole::Primary,
+                    container_len: length,
+                    logical_len: length,
+                    exact_byte_offsets: false,
+                },
+                backing: ImageBacking::LiveVmware(reader),
+            }],
+            length,
+            length,
+            ImageFormat::VmwareVmem {
+                pci_hole_start: 0xc000_0000,
+                pci_hole_size: 0x4000_0000,
+                metadata: None,
+            },
+            spans,
+            Vec::new(),
+            0,
+        )
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| matches!(source.backing, ImageBacking::LiveVmware(_)))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, ImageOpenOptions::default())
     }
@@ -362,7 +435,7 @@ impl MemoryImage {
                 logical_len: file_len,
                 exact_byte_offsets: true,
             },
-            backing: ImageBacking::Mmap(Arc::clone(&primary_mmap)),
+            backing: ImageBacking::Mmap(Arc::clone(&primary_mmap), Arc::new(file)),
         }];
 
         let metadata_path = resolve_vmware_metadata(path, &options)?;
@@ -379,8 +452,8 @@ impl MemoryImage {
             let metadata_source =
                 open_mmap_source(&metadata_path, sources.len(), ImageSourceRole::Metadata)?;
             let metadata_bytes = match &metadata_source.backing {
-                ImageBacking::Mmap(bytes) => bytes.as_ref(),
-                ImageBacking::Ewf(_) => unreachable!(),
+                ImageBacking::Mmap(bytes, _) => bytes.as_ref(),
+                ImageBacking::Ewf(_) | ImageBacking::LiveVmware(_) => unreachable!(),
             };
             let parsed = vmware::parse_vmware_metadata(metadata_bytes, file_len)
                 .with_context(|| format!("无法解析 VMware metadata {}", metadata_path.display()))?;
@@ -508,8 +581,8 @@ impl MemoryImage {
             return None;
         }
         match &self.sources.first()?.backing {
-            ImageBacking::Mmap(mmap) => Some(mmap.as_ref()),
-            ImageBacking::Ewf(_) => None,
+            ImageBacking::Mmap(mmap, _) => Some(mmap.as_ref()),
+            ImageBacking::Ewf(_) | ImageBacking::LiveVmware(_) => None,
         }
     }
 
@@ -530,7 +603,51 @@ impl MemoryImage {
             "读取范围超出 source 逻辑末尾"
         );
         match &source.backing {
-            ImageBacking::Mmap(mmap) => {
+            ImageBacking::Mmap(mmap, file) if out.len() >= BULK_READ_THRESHOLD => {
+                // Use the original open handle, never reopen a path that might now
+                // refer to another file. Random small reads keep their cached map.
+                for (index, chunk) in out.chunks_mut(BULK_READ_WINDOW).enumerate() {
+                    let chunk_offset = offset + (index * BULK_READ_WINDOW) as u64;
+                    ensure!(
+                        chunk_offset + chunk.len() as u64 <= mmap.len() as u64,
+                        "source 后备存储被截断"
+                    );
+                    #[cfg(windows)]
+                    {
+                        // Avoid MapView/UnmapView working-set churn on large
+                        // Windows scans. Every read supplies its own offset, so
+                        // concurrent scan workers never depend on a shared cursor.
+                        let mut read = 0;
+                        while read < chunk.len() {
+                            match file.seek_read(&mut chunk[read..], chunk_offset + read as u64) {
+                                Ok(0) => bail!(
+                                    "source 在偏移 {:#x} 处读取不完整",
+                                    chunk_offset + read as u64
+                                ),
+                                Ok(count) => read += count,
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(error) => return Err(error).context("无法读取镜像分块"),
+                            }
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        // SAFETY: same immutable file as the primary map; no
+                        // view escapes this iteration or outlives its borrow.
+                        let view = unsafe {
+                            MmapOptions::new()
+                                .offset(chunk_offset)
+                                .len(chunk.len())
+                                .map(file.as_ref())
+                        }
+                        .context("无法建立镜像分块读取映射")?;
+                        chunk.copy_from_slice(&view);
+                    }
+                }
+            }
+            ImageBacking::Mmap(mmap, _) => {
                 let start = usize::try_from(offset)?;
                 let end = start.checked_add(out.len()).context("文件偏移计算溢出")?;
                 out.copy_from_slice(mmap.get(start..end).context("source 后备存储被截断")?);
@@ -541,6 +658,7 @@ impl MemoryImage {
                     .with_context(|| format!("无法读取 EWF 逻辑偏移 {offset:#x}"))?;
                 ensure!(read == out.len(), "EWF 在逻辑偏移 {offset:#x} 处读取不完整");
             }
+            ImageBacking::LiveVmware(reader) => reader.read_source(offset, out)?,
         }
         Ok(())
     }
@@ -744,7 +862,7 @@ fn open_mmap_source(path: &Path, index: usize, role: ImageSourceRole) -> Result<
             logical_len: length,
             exact_byte_offsets: true,
         },
-        backing: ImageBacking::Mmap(Arc::new(mmap)),
+        backing: ImageBacking::Mmap(Arc::new(mmap), Arc::new(file)),
     })
 }
 
@@ -1284,11 +1402,7 @@ fn parse_lime(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<PhysicalS
     Ok((ImageFormat::Lime { version }, spans))
 }
 
-fn parse_dump64(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<PhysicalSpan>)> {
-    ensure!(
-        file_len >= DUMP_HEADER64_SIZE,
-        "64 位 Windows 崩溃转储头被截断"
-    );
+fn parse_dump64_runs(bytes: &[u8], file_len: u64) -> Result<(u64, Vec<PhysicalSpan>)> {
     let number_of_runs = read_u32(bytes, 0x88)?;
     ensure!(
         number_of_runs > 0 && number_of_runs <= 0x1000,
@@ -1328,7 +1442,28 @@ fn parse_dump64(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<Physica
         "转储头页数与物理区间不一致：头部={number_of_pages}，区间合计={counted_pages}"
     );
     ensure!(file_offset <= file_len, "转储的物理区间超出文件末尾");
+    Ok((number_of_pages, spans))
+}
 
+fn parse_dump64(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<PhysicalSpan>)> {
+    ensure!(
+        file_len >= DUMP_HEADER64_SIZE && bytes.len() >= DUMP_HEADER64_SIZE as usize,
+        "64 位 Windows 崩溃转储头被截断"
+    );
+    let dump_type = read_u32(bytes, 0xf98)?;
+    let (number_of_pages, spans, bitmap) = match dump_type {
+        1 => {
+            let (pages, spans) = parse_dump64_runs(bytes, file_len)?;
+            (pages, spans, None)
+        }
+        5 => {
+            let (bitmap, spans) = dump_bitmap::parse(bytes, file_len)?;
+            (bitmap.present_pages, spans, Some(bitmap))
+        }
+        _ => bail!(
+            "暂不支持 64 位 Windows 崩溃转储类型 {dump_type}；支持完整转储 (1) 和位图转储 (5)"
+        ),
+    };
     let dump = WindowsDump64 {
         major_version: read_u32(bytes, 8)?,
         minor_version: read_u32(bytes, 12)?,
@@ -1346,9 +1481,9 @@ fn parse_dump64(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<Physica
             read_u64(bytes, 0x58)?,
         ],
         kd_debugger_data_block: read_u64(bytes, 0x80)?,
-        number_of_runs,
+        number_of_runs: u32::try_from(spans.len()).context("转储物理区间数量超出 u32 范围")?,
         number_of_pages,
-        dump_type: read_u32(bytes, 0xf98)?,
+        dump_type,
         required_dump_space: read_u64(bytes, 0xfa0)?,
         system_time_raw: read_u64(bytes, 0xfa8)?,
         comment: read_c_string(bytes, 0xfb0, 128)?,
@@ -1358,6 +1493,7 @@ fn parse_dump64(bytes: &[u8], file_len: u64) -> Result<(ImageFormat, Vec<Physica
         product_type: read_u32(bytes, 0x1040)?,
         suite_mask: read_u32(bytes, 0x1044)?,
         writer_status: read_u32(bytes, 0x1048)?,
+        bitmap,
     };
     Ok((ImageFormat::WindowsCrashDump64(dump), spans))
 }
@@ -1551,6 +1687,7 @@ mod tests {
     fn dump_runs_map_after_header() {
         let mut bytes = vec![0u8; DUMP_HEADER64_SIZE as usize + 3 * 0x1000];
         bytes[..8].copy_from_slice(b"PAGEDU64");
+        put_u32(&mut bytes, 0xf98, 1);
         put_u32(&mut bytes, 0x88, 2);
         put_u64(&mut bytes, 0x90, 3);
         put_u64(&mut bytes, 0x98, 1);

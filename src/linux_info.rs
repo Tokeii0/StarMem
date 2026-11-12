@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::linux::linux_release;
-use crate::scan::scan_patterns;
+use crate::scan::scan_patterns_cancellable;
 
 const SCAN_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const LIMIT_PER_PATTERN: usize = 100_000;
@@ -67,6 +68,14 @@ struct CandidateAggregate {
 }
 
 pub fn analyze_linux_info(image: &MemoryImage) -> Result<LinuxInfoReport> {
+    analyze_linux_info_cancellable(image, &CancellationToken::new())
+}
+
+pub fn analyze_linux_info_cancellable(
+    image: &MemoryImage,
+    cancellation: &CancellationToken,
+) -> Result<LinuxInfoReport> {
+    cancellation.check_cancelled()?;
     let patterns: &[&[u8]] = &[
         LINUX_BANNER,
         JOURNAL_HOSTNAME,
@@ -76,12 +85,19 @@ pub fn analyze_linux_info(image: &MemoryImage) -> Result<LinuxInfoReport> {
         ENV_LOGNAME,
         ENV_HOME,
     ];
-    let scan = scan_patterns(image, patterns, LIMIT_PER_PATTERN, SCAN_CHUNK_SIZE)?;
+    let scan = scan_patterns_cancellable(
+        image,
+        patterns,
+        LIMIT_PER_PATTERN,
+        SCAN_CHUNK_SIZE,
+        cancellation,
+    )?;
     let mut banners = BTreeMap::<String, BTreeSet<u64>>::new();
     let mut hostnames = BTreeMap::<String, CandidateAggregate>::new();
     let mut usernames = BTreeMap::<String, CandidateAggregate>::new();
 
     for hit in &scan.hits {
+        cancellation.check_cancelled()?;
         match hit.pattern_index {
             0 => {
                 if let Some(banner) = read_ascii_c_string(image, hit.physical_address, 512)

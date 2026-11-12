@@ -7,12 +7,14 @@
 //! `.partial` suffix.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::linux::{
     LinuxKernelContext, LinuxX64AddressSpace, UBUNTU_4_13_0_36_XENIAL, UBUNTU_5_4_0_84_BIONIC,
@@ -32,6 +34,14 @@ const MAX_TREE_NODES: usize = 1_000_000;
 const MAX_TREE_ENTRIES: usize = 8_000_000;
 const MAX_REPORTED_WARNINGS: usize = 256;
 const MAX_WARNING_SAMPLES_PER_KIND: usize = 16;
+
+// Verified against the signed RHEL 7.0 kernel and kernel-devel RPMs. These
+// compile-time bases predate the runtime globals; never select by release alone.
+const RHEL_3_10_0_123: &str = "Linux version 3.10.0-123.el7.x86_64 (mockbuild@x86-017.build.eng.bos.redhat.com) (gcc version 4.8.2 20140120 (Red Hat 4.8.2-16) (GCC) ) #1 SMP Mon May 5 11:16:57 EDT 2014";
+
+fn static_page_bases(banner: &str) -> Option<(u64, u64)> {
+    (banner == RHEL_3_10_0_123).then_some((0xffff_ea00_0000_0000, 0xffff_8800_0000_0000))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LinuxRecoveredExtent {
@@ -120,6 +130,7 @@ pub struct LinuxDumpFileReport {
     pub sha256: String,
     pub sha256_scope: String,
     pub output_path: Option<String>,
+    pub recovery_report_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +187,7 @@ pub fn read_validated_file(
 /// Read a bounded prefix without changing the inode identity or claiming full recovery.
 /// The report retains the live logical size and marks the unread suffix separately
 /// through missing_ranges plus the prefix_read_limit warning. Only extents are evidence.
-pub(crate) fn read_validated_file_prefix(
+pub fn read_validated_file_prefix(
     image: &MemoryImage,
     kernel: &LinuxKernelContext,
     record: &LinuxFileScanRecord,
@@ -421,6 +432,29 @@ pub fn dump_validated_file_with_force(
     max_size: u64,
     force: bool,
 ) -> Result<LinuxDumpFileReport> {
+    dump_validated_file_cancellable(
+        image,
+        kernel,
+        record,
+        output,
+        max_size,
+        force,
+        &CancellationToken::new(),
+    )
+}
+
+/// Plan validated extents, then stream them into an atomic output. Neither pass allocates
+/// the logical file size. The second pass verifies the planned hash before publication.
+pub fn dump_validated_file_cancellable(
+    image: &MemoryImage,
+    kernel: &LinuxKernelContext,
+    record: &LinuxFileScanRecord,
+    output: &Path,
+    max_size: u64,
+    force: bool,
+    cancellation: &CancellationToken,
+) -> Result<LinuxDumpFileReport> {
+    cancellation.check_cancelled()?;
     let partial = partial_output_path(output)?;
     let mut output_policy = OutputPolicy::new(force);
     for source in image.sources() {
@@ -429,15 +463,64 @@ pub fn dump_validated_file_with_force(
     output_policy.output(OutputTarget::file("recovered_file", output).with_derived_path(&partial));
     output_policy.preflight()?;
 
-    let mut recovered = read_validated_file(image, kernel, record, max_size)?;
-    let actual_path = if recovered.report.complete {
+    ensure!(max_size > 0, "页缓存文件恢复上限必须大于零");
+    let profile = pagecache_profile(kernel)?;
+    profile.validate()?;
+    let space = LinuxX64AddressSpace::new(image, kernel.directory_table_base)?;
+    let validated = validate_file_anchors(&space, profile, kernel, record, max_size)?;
+    let mut recoverer = PageCacheRecoverer::new(image, space, profile, kernel, &validated)?;
+    recoverer.cancellation = cancellation.clone();
+    recoverer.walk(validated.tree_head)?;
+    let mut report = recoverer.finish_to(record, validated, &mut std::io::sink())?;
+    let actual_path = if report.complete {
         output
     } else {
         partial.as_path()
     };
-    output_policy.write_bytes_atomic(actual_path, &recovered.bytes)?;
-    recovered.report.output_path = Some(actual_path.display().to_string());
-    Ok(recovered.report)
+    output_policy.write_file_atomic(actual_path, |file| {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        stream_reconstruction(image, &report, &mut writer, cancellation)?;
+        writer.flush()?;
+        cancellation.check_cancelled()
+    })?;
+    report.output_path = Some(actual_path.display().to_string());
+    Ok(report)
+}
+
+pub(crate) fn write_recovery_sidecar(
+    image: &MemoryImage,
+    report: &mut LinuxDumpFileReport,
+    actual: &Path,
+    policy: &OutputPolicy,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct Artifact<'a> {
+        image_sources: Vec<String>,
+        recovery: &'a LinuxDumpFileReport,
+    }
+    let path = crate::output_policy::append_path_suffix(actual, ".recovery.json");
+    report.recovery_report_path = Some(path.display().to_string());
+    let artifact = Artifact {
+        image_sources: image
+            .sources()
+            .map(|source| source.path.display().to_string())
+            .collect(),
+        recovery: report,
+    };
+    policy
+        .write_file_atomic(&path, |file| {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &artifact)?;
+            writer.flush()?;
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "文件内容已保存到 {}，但恢复范围说明未能保存到 {}",
+                actual.display(),
+                path.display()
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +561,8 @@ struct ExactPageCacheProfile {
     vmemmap_base_symbol: u64,
     max_pfn_symbol: u64,
     page_offset_base_symbol: u64,
+    static_bases: Option<(u64, u64)>,
+    legacy_radix_path: bool,
     dentry_parent: u64,
     dentry_inode: u64,
     dentry_super_block: u64,
@@ -520,13 +605,52 @@ impl ExactPageCacheProfile {
                     FolioLayout::from_isf(isf)?,
                 )
             };
+        let legacy_radix_path = tree == TreeKind::Radix
+            && isf
+                .optional_field_offset("radix_tree_node", "path")?
+                .is_some();
+        if legacy_radix_path {
+            // 64-slot path/height radix layout from the exact ISF. Old internal
+            // child pointers are untagged, and private_data is not a root owner.
+            for (field, offset, size) in [
+                ("path", 0, 4),
+                ("count", 4, 4),
+                ("parent", 8, 8),
+                (
+                    "slots",
+                    TREE_SLOTS_OFFSET as u64,
+                    (TREE_MAP_SIZE * 8) as u64,
+                ),
+            ] {
+                ensure!(
+                    isf.field_offset("radix_tree_node", field)? == offset
+                        && isf.field_size("radix_tree_node", field)? == size,
+                    "旧 radix_tree_node.{field} 布局不受支持"
+                );
+            }
+            ensure!(
+                isf.field_size("radix_tree_root", "height")? == 4,
+                "旧 radix_tree_root.height 不是 32 位字段"
+            );
+        }
+        let static_bases = static_page_bases(isf.banner());
+        let (vmemmap_base_symbol, page_offset_base_symbol) = if static_bases.is_some() {
+            (0, 0)
+        } else {
+            (
+                isf.symbol_address("vmemmap_base")?,
+                isf.symbol_address("page_offset_base")?,
+            )
+        };
         Ok(Self {
             source: "volatility3_isf_pagecache",
             fingerprint: "Volatility 3 ISF; exact linux_banner; runtime-validated page-cache layout",
             init_task_symbol: isf.symbol_address("init_task")?,
-            vmemmap_base_symbol: isf.symbol_address("vmemmap_base")?,
+            vmemmap_base_symbol,
             max_pfn_symbol: isf.symbol_address("max_pfn")?,
-            page_offset_base_symbol: isf.symbol_address("page_offset_base")?,
+            page_offset_base_symbol,
+            static_bases,
+            legacy_radix_path,
             dentry_parent: isf.field_offset("dentry", "d_parent")?,
             dentry_inode: isf.field_offset("dentry", "d_inode")?,
             dentry_super_block: isf.field_offset("dentry", "d_sb")?,
@@ -555,6 +679,8 @@ impl ExactPageCacheProfile {
                 vmemmap_base_symbol: 0xffff_ffff_8224_8a80,
                 max_pfn_symbol: 0xffff_ffff_8285_1d70,
                 page_offset_base_symbol: 0xffff_ffff_8224_8a90,
+                static_bases: None,
+                legacy_radix_path: false,
                 dentry_parent: 0x18,
                 dentry_inode: 0x30,
                 dentry_super_block: 0x68,
@@ -581,6 +707,8 @@ impl ExactPageCacheProfile {
                 vmemmap_base_symbol: 0xffff_ffff_8243_e330,
                 max_pfn_symbol: 0xffff_ffff_82cb_08d8,
                 page_offset_base_symbol: 0xffff_ffff_8243_e340,
+                static_bases: None,
+                legacy_radix_path: false,
                 dentry_parent: 0x18,
                 dentry_inode: 0x30,
                 dentry_super_block: 0x68,
@@ -610,6 +738,8 @@ impl ExactPageCacheProfile {
                 vmemmap_base_symbol: 0xffff_ffff_82d3_8558,
                 max_pfn_symbol: 0xffff_ffff_83ea_c018,
                 page_offset_base_symbol: 0xffff_ffff_82d3_8568,
+                static_bases: None,
+                legacy_radix_path: false,
                 dentry_parent: 0x18,
                 dentry_inode: 0x30,
                 dentry_super_block: 0x70,
@@ -638,11 +768,21 @@ impl ExactPageCacheProfile {
     fn validate(self) -> Result<()> {
         for (name, address) in [
             ("init_task", self.init_task_symbol),
-            ("vmemmap_base", self.vmemmap_base_symbol),
             ("max_pfn", self.max_pfn_symbol),
-            ("page_offset_base", self.page_offset_base_symbol),
         ] {
             ensure!(is_kernel_pointer(address), "profile {name} 符号地址无效");
+        }
+        if let Some((vmemmap, direct)) = self.static_bases {
+            ensure!(
+                is_kernel_pointer(vmemmap) && is_kernel_pointer(direct),
+                "静态页基址无效"
+            );
+        } else {
+            ensure!(
+                is_kernel_pointer(self.vmemmap_base_symbol)
+                    && is_kernel_pointer(self.page_offset_base_symbol),
+                "页基址符号地址无效"
+            );
         }
         ensure!(
             self.page_mapping + 8 <= PAGE_STRUCT_SIZE,
@@ -696,6 +836,10 @@ impl FolioLayout {
 }
 
 fn pagecache_profile(kernel: &LinuxKernelContext) -> Result<ExactPageCacheProfile> {
+    ensure!(
+        kernel.system_map.is_none() || kernel.symbol_table.is_some(),
+        "System.map 不包含页缓存类型；自动补齐尚未找到匹配的 Linux ISF"
+    );
     if let Some(isf) = kernel.symbol_table.as_deref() {
         return ExactPageCacheProfile::from_isf(isf).or_else(|isf_error| {
             ExactPageCacheProfile::for_banner(&kernel.banner).with_context(|| {
@@ -746,8 +890,26 @@ fn load_runtime_layout(
             .checked_add(slide)
             .with_context(|| format!("{name} 运行时地址溢出"))
     };
-    let vmemmap_base =
-        space.read_u64(runtime_symbol(profile.vmemmap_base_symbol, "vmemmap_base")?)?;
+    let (vmemmap_base, page_offset_base) = if let Some(bases) = profile.static_bases {
+        let physical = space.translate(kernel.init_task)?;
+        let alias = bases
+            .1
+            .checked_add(physical)
+            .context("静态直接映射地址溢出")?;
+        ensure!(
+            space.translate(alias)? == physical,
+            "静态直接映射基址未通过 init_task 物理页复验"
+        );
+        bases
+    } else {
+        (
+            space.read_u64(runtime_symbol(profile.vmemmap_base_symbol, "vmemmap_base")?)?,
+            space.read_u64(runtime_symbol(
+                profile.page_offset_base_symbol,
+                "page_offset_base",
+            )?)?,
+        )
+    };
     ensure!(
         is_kernel_pointer(vmemmap_base),
         "vmemmap_base 值不是规范内核地址"
@@ -759,10 +921,6 @@ fn load_runtime_layout(
     let max_pfn = space.read_u64(runtime_symbol(profile.max_pfn_symbol, "max_pfn")?)?;
     ensure!(max_pfn > 0, "max_pfn 为零");
     ensure!(max_pfn <= u64::MAX / PAGE_SIZE, "max_pfn 超出物理地址范围");
-    let page_offset_base = space.read_u64(runtime_symbol(
-        profile.page_offset_base_symbol,
-        "page_offset_base",
-    )?)?;
     ensure!(
         is_kernel_pointer(page_offset_base),
         "page_offset_base 值不是规范内核地址"
@@ -998,6 +1156,7 @@ impl WarningState {
 }
 
 struct PageCacheRecoverer<'a> {
+    cancellation: CancellationToken,
     image: &'a MemoryImage,
     space: LinuxX64AddressSpace<'a>,
     profile: ExactPageCacheProfile,
@@ -1028,6 +1187,7 @@ impl<'a> PageCacheRecoverer<'a> {
         file: &ValidatedFile,
     ) -> Result<Self> {
         Ok(Self {
+            cancellation: CancellationToken::new(),
             image,
             space,
             profile,
@@ -1063,6 +1223,7 @@ impl<'a> PageCacheRecoverer<'a> {
     }
 
     fn walk(&mut self, head: u64) -> Result<()> {
+        self.cancellation.check_cancelled()?;
         match self.profile.tree {
             TreeKind::Radix => self.walk_radix(head),
             TreeKind::XArray => self.walk_xarray(head),
@@ -1141,6 +1302,7 @@ impl<'a> PageCacheRecoverer<'a> {
 
     fn walk_nodes(&mut self, mut pending: Vec<PendingNode>) -> Result<()> {
         while let Some(node) = pending.pop() {
+            self.cancellation.check_cancelled()?;
             if self.tree_nodes_seen >= MAX_TREE_NODES {
                 self.warnings.push(
                     "tree_node_limit",
@@ -1181,9 +1343,30 @@ impl<'a> PageCacheRecoverer<'a> {
                 );
                 continue;
             }
-            let shift = bytes[0];
-            let offset = bytes[1];
-            let count = bytes[2] as usize;
+            let (shift, offset, count, exceptional_count) = if self.profile.legacy_radix_path {
+                let header = u64_at(&bytes, 0)?;
+                let path = header as u32;
+                let height = path & 0xfff; // RADIX_TREE_HEIGHT_MASK for 64 slots.
+                let offset = path >> 12;
+                if !(1..=11).contains(&height) || offset >= TREE_MAP_SIZE as u32 {
+                    self.warnings.push(
+                        "tree_node_height",
+                        "旧 radix 节点 path/height 无效",
+                        Some(node.address),
+                        true,
+                    );
+                    continue;
+                }
+                let count = (header >> 32) as usize;
+                (
+                    ((height - 1) * 6) as u8,
+                    offset as u8,
+                    count & 0x7f,
+                    count >> 7,
+                )
+            } else {
+                (bytes[0], bytes[1], bytes[2] as usize, bytes[3] as usize)
+            };
             if shift > 60 || !shift.is_multiple_of(TREE_MAP_SHIFT) {
                 self.warnings.push(
                     "tree_node_shift",
@@ -1237,7 +1420,7 @@ impl<'a> PageCacheRecoverer<'a> {
                 continue;
             }
             let owner = u64_at(&bytes, 0x10)?;
-            if owner != self.tree_root {
+            if !self.profile.legacy_radix_path && owner != self.tree_root {
                 self.warnings.push(
                     "tree_node_owner",
                     format!(
@@ -1263,7 +1446,7 @@ impl<'a> PageCacheRecoverer<'a> {
                     true,
                 );
             }
-            if self.profile.tree == TreeKind::Radix && bytes[3] as usize > count {
+            if self.profile.tree == TreeKind::Radix && exceptional_count > count {
                 self.warnings.push(
                     "radix_exceptional_count",
                     "radix exceptional 计数大于总计数",
@@ -1308,7 +1491,22 @@ impl<'a> PageCacheRecoverer<'a> {
 
                 match self.profile.tree {
                     TreeKind::Radix => {
-                        if entry & 1 != 0 {
+                        if self.profile.legacy_radix_path && entry & 1 != 0 {
+                            self.warnings.push(
+                                "radix_retry_entry",
+                                "旧 radix 缩树重试指针不能作为有效叶子或子节点",
+                                Some(entry),
+                                true,
+                            );
+                        } else if self.profile.legacy_radix_path && entry & 3 == 0 && shift > 0 {
+                            pending.push(PendingNode {
+                                address: entry,
+                                parent: Some(node.address),
+                                parent_slot: slot as u8,
+                                expected_shift: Some(shift - TREE_MAP_SHIFT),
+                                base_index: index,
+                            });
+                        } else if entry & 1 != 0 {
                             let target = entry & !1;
                             let slot_start = node.address + TREE_SLOTS_OFFSET as u64;
                             let slot_end = slot_start + (TREE_MAP_SIZE * 8) as u64;
@@ -1769,10 +1967,24 @@ impl<'a> PageCacheRecoverer<'a> {
     }
 
     fn finish(
-        mut self,
+        self,
         record: &LinuxFileScanRecord,
         file: ValidatedFile,
     ) -> Result<LinuxRecoveredFile> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(usize::try_from(self.output_limit)?)
+            .context("无法为页缓存文件恢复分配逻辑输出缓冲区")?;
+        let report = self.finish_to(record, file, &mut bytes)?;
+        Ok(LinuxRecoveredFile { bytes, report })
+    }
+
+    fn finish_to(
+        mut self,
+        record: &LinuxFileScanRecord,
+        file: ValidatedFile,
+        writer: &mut impl Write,
+    ) -> Result<LinuxDumpFileReport> {
         if self.cached_pages_validated != self.cached_pages {
             self.warnings.push(
                 "cached_page_count_mismatch",
@@ -1785,19 +1997,9 @@ impl<'a> PageCacheRecoverer<'a> {
             );
         }
 
-        let output_len = usize::try_from(self.output_limit)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(output_len)
-            .context("无法为页缓存文件恢复分配逻辑输出缓冲区")?;
-        bytes.resize(output_len, 0);
         let output_pages = self.output_limit.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
-        let expected_pages_len = usize::try_from(output_pages)?;
-        let mut recovered_pages = Vec::new();
-        recovered_pages
-            .try_reserve_exact(expected_pages_len)
-            .context("无法为页缓存文件恢复分配页状态缓冲区")?;
-        recovered_pages.resize(expected_pages_len, false);
+        let mut output = RecoveryWriter::new(writer, &self.cancellation);
+        let mut missing_ranges = Vec::new();
         let mut extents = Vec::new();
         let mut pages_recovered = 0u64;
         let folios: Vec<_> = self.folios.values().cloned().collect();
@@ -1807,6 +2009,7 @@ impl<'a> PageCacheRecoverer<'a> {
             }
             let pages_in_file = folio.pages.min(output_pages - folio.index);
             for offset in 0..pages_in_file {
+                self.cancellation.check_cancelled()?;
                 let index = folio.index + offset;
                 let pfn = folio.pfn + offset;
                 let physical = pfn.checked_mul(PAGE_SIZE).context("恢复页物理地址溢出")?;
@@ -1822,23 +2025,27 @@ impl<'a> PageCacheRecoverer<'a> {
                 }
                 let file_offset = index.checked_mul(PAGE_SIZE).context("恢复文件偏移溢出")?;
                 let take = PAGE_SIZE.min(self.output_limit - file_offset);
-                let start = usize::try_from(file_offset)?;
-                let end = start
-                    .checked_add(usize::try_from(take)?)
-                    .context("恢复范围溢出")?;
-                bytes[start..end].copy_from_slice(&page_bytes[..take as usize]);
-                recovered_pages[index as usize] = true;
+                if file_offset > output.offset {
+                    missing_ranges.push(LinuxMissingRange {
+                        file_offset: output.offset,
+                        length: file_offset - output.offset,
+                    });
+                }
+                output.zeros_until(file_offset)?;
+                output.write(&page_bytes[..take as usize])?;
                 pages_recovered += 1;
                 push_extent(&mut extents, file_offset, take, index, physical);
             }
         }
 
-        let mut missing_ranges = build_missing_ranges(&recovered_pages, self.output_limit);
-        if self.output_limit < self.logical_size {
+        if output.offset < self.logical_size {
             missing_ranges.push(LinuxMissingRange {
-                file_offset: self.output_limit,
-                length: self.logical_size - self.output_limit,
+                file_offset: output.offset,
+                length: self.logical_size - output.offset,
             });
+        }
+        output.zeros_until(self.output_limit)?;
+        if self.output_limit < self.logical_size {
             self.warnings.push(
                 "prefix_read_limit",
                 format!(
@@ -1859,7 +2066,7 @@ impl<'a> PageCacheRecoverer<'a> {
         self.warnings.finish();
         let tree_complete = self.warnings.tree_complete;
         let complete = missing_bytes == 0 && tree_complete;
-        let sha256 = sha256_hex(&bytes);
+        let sha256 = hex::encode(output.hash.finalize());
         let sha256_scope = if complete {
             "complete_recovered_file"
         } else if self.output_limit < self.logical_size {
@@ -1899,7 +2106,7 @@ impl<'a> PageCacheRecoverer<'a> {
             page_offset_base_hex: format_address(self.page_offset_base),
             max_pfn: self.max_pfn,
             logical_size: self.logical_size,
-            output_size: bytes.len() as u64,
+            output_size: self.output_limit,
             recovered_bytes,
             missing_bytes,
             expected_pages: self.expected_pages,
@@ -1919,10 +2126,85 @@ impl<'a> PageCacheRecoverer<'a> {
             sha256,
             sha256_scope,
             output_path: None,
+            recovery_report_path: None,
         };
         debug_assert_eq!(file.mapping, report.mapping);
-        Ok(LinuxRecoveredFile { bytes, report })
+        Ok(report)
     }
+}
+
+/// The byte buffer is bounded even when an inode has a large sparse logical size.
+struct RecoveryWriter<'a, W: Write> {
+    writer: &'a mut W,
+    cancellation: &'a CancellationToken,
+    hash: Sha256,
+    offset: u64,
+}
+
+impl<'a, W: Write> RecoveryWriter<'a, W> {
+    fn new(writer: &'a mut W, cancellation: &'a CancellationToken) -> Self {
+        Self {
+            writer,
+            cancellation,
+            hash: Sha256::new(),
+            offset: 0,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.cancellation.check_cancelled()?;
+        self.writer.write_all(bytes)?;
+        self.hash.update(bytes);
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn zeros_until(&mut self, offset: u64) -> Result<()> {
+        ensure!(offset >= self.offset, "页缓存导出范围重叠或倒退");
+        if offset == self.offset {
+            return Ok(());
+        }
+        let zeros = [0u8; 64 * 1024];
+        while self.offset < offset {
+            self.write(&zeros[..(offset - self.offset).min(zeros.len() as u64) as usize])?;
+        }
+        Ok(())
+    }
+}
+
+fn stream_reconstruction(
+    image: &MemoryImage,
+    report: &LinuxDumpFileReport,
+    writer: &mut impl Write,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let progress = crate::progress::start_progress("Linux 文件内容导出", report.output_size);
+    let mut output = RecoveryWriter::new(writer, cancellation);
+    let mut bytes = vec![0u8; 1024 * 1024];
+    for extent in &report.extents {
+        let previous = output.offset;
+        output.zeros_until(extent.file_offset)?;
+        progress.advance(output.offset - previous);
+        let mut copied = 0;
+        while copied < extent.length {
+            cancellation.check_cancelled()?;
+            let take = (extent.length - copied).min(bytes.len() as u64) as usize;
+            image.read_physical(extent.physical_address + copied, &mut bytes[..take])?;
+            output.write(&bytes[..take])?;
+            copied += take as u64;
+            progress.advance(take as u64);
+        }
+    }
+    let previous = output.offset;
+    output.zeros_until(report.output_size)?;
+    progress.advance(output.offset - previous);
+    ensure!(
+        hex::encode(output.hash.finalize()) == report.sha256,
+        "镜像内容在恢复核对后发生变化，拒绝发布文件"
+    );
+    cancellation.check_cancelled()?;
+    progress.finish();
+    Ok(())
 }
 
 fn push_extent(
@@ -1950,6 +2232,7 @@ fn push_extent(
     });
 }
 
+#[cfg(test)]
 fn build_missing_ranges(recovered: &[bool], logical_size: u64) -> Vec<LinuxMissingRange> {
     let mut ranges = Vec::new();
     let mut start = None;
@@ -2030,10 +2313,6 @@ fn low_mask(bits: u8) -> u64 {
 
 fn format_address(address: u64) -> String {
     format!("{address:#018x}")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -2269,6 +2548,15 @@ mod tests {
         assert!(output.exists());
         assert!(!partial.exists());
         assert_eq!(report.output_path, Some(output.display().to_string()));
+        let expected = read_validated_file(
+            &image,
+            &fixture.kernel,
+            &fixture.record,
+            report.logical_size,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), expected.bytes);
+        assert_eq!(report.sha256, expected.report.sha256);
 
         drop(image);
         fs::remove_file(fixture.image_path).unwrap();
@@ -2386,6 +2674,100 @@ mod tests {
     }
 
     #[test]
+    fn legacy_radix_reads_path_height_and_untagged_children_but_rejects_retry_nodes() {
+        for retry in [false, true] {
+            let mut profile = ExactPageCacheProfile::for_banner(UBUNTU_4_13_0_36_XENIAL).unwrap();
+            profile.legacy_radix_path = true;
+            let child = TEST_NODE + 0x10_0000;
+            let index = 3 * 64 + 2;
+            let logical_size = (index + 1) * PAGE_SIZE;
+            let pfn = 0x900;
+            let page = TEST_VMEMMAP + pfn * PAGE_STRUCT_SIZE;
+            let mut memory = SyntheticMemory::new();
+            map_common_objects(&mut memory, profile, page);
+            memory.map_new_page(child);
+            write_common_anchors(&mut memory, profile, logical_size, 1, TEST_NODE | 1);
+            memory.put_virtual_u64(TEST_NODE, 2 | (1 << 32));
+            memory.put_virtual_u64(
+                TEST_NODE + TREE_SLOTS_OFFSET as u64 + 3 * 8,
+                child | u64::from(retry),
+            );
+            memory.put_virtual_u64(child, (3 << 12) | 1 | (1 << 32));
+            memory.put_virtual_u64(child + 8, TEST_NODE);
+            // Old private_data is zero, not the modern owner/root pointer.
+            memory.put_virtual_u64(child + TREE_SLOTS_OFFSET as u64 + 2 * 8, page);
+            memory.put_virtual_u64(page + profile.page_mapping, TEST_MAPPING);
+            memory.put_virtual_u64(page + profile.page_index, index);
+            memory.fill_physical(pfn * PAGE_SIZE, PAGE_SIZE, 0x5a);
+            let path = memory.publish("legacy-radix");
+            let image = MemoryImage::open(&path).unwrap();
+            let space = LinuxX64AddressSpace::new(&image, 0x1000).unwrap();
+            let kernel = synthetic_kernel(RHEL_3_10_0_123, profile);
+            let record = synthetic_record(logical_size, 1);
+            let file =
+                validate_file_anchors(&space, profile, &kernel, &record, logical_size).unwrap();
+            let mut recoverer =
+                PageCacheRecoverer::new(&image, space, profile, &kernel, &file).unwrap();
+            recoverer.walk(file.tree_head).unwrap();
+            if retry {
+                assert!(recoverer.folios.is_empty());
+                assert!(!recoverer.warnings.tree_complete);
+                assert!(
+                    recoverer
+                        .warnings
+                        .records
+                        .iter()
+                        .any(|warning| warning.kind == "radix_retry_entry")
+                );
+            } else {
+                assert_eq!(recoverer.folios.len(), 1);
+                assert_eq!(recoverer.folios[&index].pfn, pfn);
+                let recovered = recoverer.finish(&record, file).unwrap();
+                assert!(recovered.report.tree_complete);
+                assert!(!recovered.report.complete); // Earlier file pages are absent.
+                assert_eq!(recovered.report.recovered_bytes, PAGE_SIZE);
+                assert!(
+                    recovered.bytes[index as usize * PAGE_SIZE as usize..]
+                        .iter()
+                        .all(|byte| *byte == 0x5a)
+                );
+            }
+            drop(image);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rhel_static_bases_require_exact_banner_and_matching_direct_map_alias() {
+        assert_eq!(
+            static_page_bases(RHEL_3_10_0_123),
+            Some((0xffff_ea00_0000_0000, 0xffff_8800_0000_0000))
+        );
+        assert!(static_page_bases("Linux version 3.10.0-123.el7.x86_64").is_none());
+        assert!(static_page_bases(&RHEL_3_10_0_123.replace("Mon May 5", "Mon Jun 30")).is_none());
+        for valid_alias in [false, true] {
+            let mut profile = ExactPageCacheProfile::for_banner(UBUNTU_4_13_0_36_XENIAL).unwrap();
+            profile.static_bases = Some((TEST_VMEMMAP, TEST_PAGE_OFFSET));
+            let mut memory = SyntheticMemory::new();
+            let physical_page = memory.map_new_page(profile.init_task_symbol);
+            memory.map_page(
+                TEST_PAGE_OFFSET + physical_page,
+                physical_page + if valid_alias { 0 } else { PAGE_SIZE },
+            );
+            memory.map_new_page(profile.max_pfn_symbol);
+            memory.put_virtual_u64(profile.max_pfn_symbol, TEST_MAX_PFN);
+            let path = memory.publish("static-page-bases");
+            let image = MemoryImage::open(&path).unwrap();
+            let space = LinuxX64AddressSpace::new(&image, 0x1000).unwrap();
+            let kernel = synthetic_kernel(RHEL_3_10_0_123, profile);
+            let layout = load_runtime_layout(&space, profile, &kernel);
+            assert_eq!(layout.is_ok(), valid_alias);
+            drop(image);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn reverses_a_physical_content_address_through_page_cache_anchors() {
         let fixture = radix_413_fixture("radix-reverse-page");
         let image = MemoryImage::open(&fixture.image_path).unwrap();
@@ -2419,8 +2801,16 @@ mod tests {
     }
 
     fn xarray_68_fixture(page_index: u64, declared_count: u8, label: &str) -> SyntheticFixture {
+        xarray_68_fixture_sized(page_index, declared_count, label, PAGE_SIZE * 4 - 17)
+    }
+
+    fn xarray_68_fixture_sized(
+        page_index: u64,
+        declared_count: u8,
+        label: &str,
+        logical_size: u64,
+    ) -> SyntheticFixture {
         let profile = ExactPageCacheProfile::for_banner(UBUNTU_6_8_0_49_NOBLE).unwrap();
-        let logical_size = PAGE_SIZE * 4 - 17;
         let pfn = 0x800;
         let page = TEST_VMEMMAP + pfn * PAGE_STRUCT_SIZE;
         let mut memory = SyntheticMemory::new();
@@ -2453,6 +2843,127 @@ mod tests {
             kernel: synthetic_kernel(UBUNTU_6_8_0_49_NOBLE, profile),
             record: synthetic_record(logical_size, 4),
         }
+    }
+
+    #[test]
+    fn streaming_dump_exceeds_64_mib_and_preserves_missing_tail() {
+        use std::io::{Read, Seek, SeekFrom};
+        let size = 65 * 1024 * 1024 + 17;
+        let fixture = xarray_68_fixture_sized(0, 4, "large-streaming-dump", size);
+        let image = MemoryImage::open(&fixture.image_path).unwrap();
+        let output = temporary_path("large-streaming-output");
+        let report =
+            dump_validated_file(&image, &fixture.kernel, &fixture.record, &output, size).unwrap();
+        let partial = partial_output_path(&output).unwrap();
+        assert!(!output.exists());
+        assert!(!report.complete);
+        assert_eq!(report.output_size, size);
+        assert_eq!(report.recovered_bytes, PAGE_SIZE * 4);
+        assert_eq!(
+            report.missing_ranges,
+            vec![LinuxMissingRange {
+                file_offset: PAGE_SIZE * 4,
+                length: size - PAGE_SIZE * 4
+            }]
+        );
+        assert_eq!(fs::metadata(&partial).unwrap().len(), size);
+        let mut file = fs::File::open(&partial).unwrap();
+        let mut head = [0u8; 16];
+        file.read_exact(&mut head).unwrap();
+        assert_eq!(head, [0x31; 16]);
+        file.seek(SeekFrom::End(-16)).unwrap();
+        file.read_exact(&mut head).unwrap();
+        assert_eq!(head, [0; 16]);
+        drop(file);
+        drop(image);
+        fs::remove_file(partial).unwrap();
+        fs::remove_file(fixture.image_path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_streaming_dump_does_not_publish_or_replace_outputs() {
+        let fixture = xarray_68_fixture(0, 4, "cancel-streaming-dump");
+        let image = MemoryImage::open(&fixture.image_path).unwrap();
+        let output = temporary_path("cancel-streaming-output");
+        fs::write(&output, b"existing").unwrap();
+        let token = CancellationToken::new();
+        token.request_cancel();
+        let error = dump_validated_file_cancellable(
+            &image,
+            &fixture.kernel,
+            &fixture.record,
+            &output,
+            64 * 1024 * 1024,
+            true,
+            &token,
+        )
+        .unwrap_err();
+        assert!(crate::cancellation::is_cancellation_error(&error));
+        assert_eq!(fs::read(&output).unwrap(), b"existing");
+        assert!(!partial_output_path(&output).unwrap().exists());
+        drop(image);
+        fs::remove_file(output).unwrap();
+        fs::remove_file(fixture.image_path).unwrap();
+    }
+
+    #[test]
+    fn streaming_writer_observes_cancellation_between_chunks() {
+        struct CancelWriter(CancellationToken);
+        impl Write for CancelWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.request_cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let token = CancellationToken::new();
+        let mut sink = CancelWriter(token.clone());
+        let mut writer = RecoveryWriter::new(&mut sink, &token);
+        let error = writer.zeros_until(128 * 1024).unwrap_err();
+        assert!(crate::cancellation::is_cancellation_error(&error));
+        assert_eq!(writer.offset, 64 * 1024);
+    }
+
+    #[test]
+    fn recovery_sidecar_keeps_source_identity_hash_and_partial_ranges() {
+        let size = PAGE_SIZE * 6;
+        let fixture = xarray_68_fixture_sized(0, 4, "sidecar", size);
+        let image = MemoryImage::open(&fixture.image_path).unwrap();
+        let output = temporary_path("sidecar-output");
+        let mut report =
+            dump_validated_file(&image, &fixture.kernel, &fixture.record, &output, size).unwrap();
+        let actual = partial_output_path(&output).unwrap();
+        let path = crate::output_policy::append_path_suffix(&actual, ".recovery.json");
+        let mut policy = OutputPolicy::new(false);
+        policy.protect_file("image", &fixture.image_path);
+        policy.output_file("sidecar", &path);
+        write_recovery_sidecar(&image, &mut report, &actual, &policy).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            json["image_sources"][0],
+            fixture.image_path.display().to_string()
+        );
+        assert_eq!(json["recovery"]["dentry_hex"], fixture.record.dentry_hex);
+        assert_eq!(json["recovery"]["sha256"], report.sha256);
+        assert_eq!(
+            json["recovery"]["missing_ranges"][0]["file_offset"],
+            PAGE_SIZE * 4
+        );
+        assert_eq!(
+            json["recovery"]["missing_ranges"][0]["length"],
+            PAGE_SIZE * 2
+        );
+        assert_eq!(json["recovery"]["complete"], false);
+        assert_eq!(
+            json["recovery"]["output_path"],
+            actual.display().to_string()
+        );
+        drop(image);
+        fs::remove_file(actual).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_file(fixture.image_path).unwrap();
     }
 
     fn radix_413_fixture(label: &str) -> SyntheticFixture {
@@ -2539,6 +3050,7 @@ mod tests {
             task_struct_size: 0,
             task_struct_offsets: BTreeMap::new(),
             symbol_table: None,
+            system_map: None,
         }
     }
 

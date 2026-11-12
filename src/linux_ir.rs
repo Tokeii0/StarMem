@@ -47,6 +47,7 @@ pub const TASK_MODULES: &[&str] = &[
     "psscan",
     "perf-events",
     "callstack",
+    "cwd",
     "dns",
     "triage",
     "indicators",

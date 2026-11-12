@@ -77,9 +77,9 @@ pub struct PipeScanReport {
 }
 
 #[derive(Debug, Clone)]
-struct NpfsDeviceEvidence {
-    driver_object: u64,
-    driver_name: String,
+pub(super) struct FileSystemDeviceEvidence {
+    pub driver_object: u64,
+    pub driver_name: String,
 }
 
 pub fn scan_pipes(
@@ -119,16 +119,16 @@ pub fn scan_pipes(
         .map(|warning| format!("FILE_OBJECT 扫描：{warning}"))
         .collect::<Vec<_>>();
     let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
-    let mut device_cache: HashMap<u64, Option<NpfsDeviceEvidence>> = HashMap::new();
+    let mut device_cache: HashMap<u64, Option<FileSystemDeviceEvidence>> = HashMap::new();
     let mut records = Vec::new();
 
     for file in file_report.records {
         let Some(raw_name) = file.name.filter(|name| !name.trim_matches('\0').is_empty()) else {
             continue;
         };
-        let evidence = device_cache
-            .entry(file.device_object)
-            .or_insert_with(|| validate_npfs_device(&space, profile, file.device_object));
+        let evidence = device_cache.entry(file.device_object).or_insert_with(|| {
+            validate_file_system_device(&space, profile, file.device_object, "npfs")
+        });
         let Some(evidence) = evidence.clone() else {
             continue;
         };
@@ -234,11 +234,12 @@ pub fn scan_pipes(
     })
 }
 
-fn validate_npfs_device(
+pub(super) fn validate_file_system_device(
     space: &X64AddressSpace<'_>,
     profile: &KernelProfile,
     device_object: u64,
-) -> Option<NpfsDeviceEvidence> {
+    driver_basename: &str,
+) -> Option<FileSystemDeviceEvidence> {
     if !is_kernel_pointer(device_object) {
         return None;
     }
@@ -271,10 +272,10 @@ fn validate_npfs_device(
         .ok()?
         .offset;
     let driver_name = read_unicode_string(space, driver_object + name_field, 4096).ok()?;
-    if !is_npfs_driver_name(&driver_name) {
+    if !is_file_system_driver_name(&driver_name, driver_basename) {
         return None;
     }
-    Some(NpfsDeviceEvidence {
+    Some(FileSystemDeviceEvidence {
         driver_object,
         driver_name,
     })
@@ -301,10 +302,10 @@ fn normalize_pipe_name(raw_name: &str) -> Option<(String, String)> {
     })
 }
 
-fn is_npfs_driver_name(name: &str) -> bool {
+fn is_file_system_driver_name(name: &str, expected: &str) -> bool {
     name.rsplit(['\\', '/'])
         .find(|component| !component.is_empty())
-        .is_some_and(|component| component.eq_ignore_ascii_case("npfs"))
+        .is_some_and(|component| component.eq_ignore_ascii_case(expected))
 }
 
 fn type_u16(
@@ -376,10 +377,15 @@ mod tests {
 
     #[test]
     fn identifies_only_npfs_driver_basename() {
-        assert!(is_npfs_driver_name(r"\FileSystem\Npfs"));
-        assert!(is_npfs_driver_name("NPFS"));
-        assert!(!is_npfs_driver_name(r"\Driver\Npf"));
-        assert!(!is_npfs_driver_name(r"\FileSystem\NpfsExtra"));
+        assert!(is_file_system_driver_name(r"\FileSystem\Npfs", "npfs"));
+        assert!(is_file_system_driver_name("NPFS", "npfs"));
+        assert!(!is_file_system_driver_name(r"\Driver\Npf", "npfs"));
+        assert!(!is_file_system_driver_name(
+            r"\FileSystem\NpfsExtra",
+            "npfs"
+        ));
+        assert!(is_file_system_driver_name(r"\FileSystem\Msfs", "msfs"));
+        assert!(!is_file_system_driver_name(r"\FileSystem\Npfs", "msfs"));
     }
 
     #[test]

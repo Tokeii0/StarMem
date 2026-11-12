@@ -9,10 +9,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::address::{VirtualAddressRegion, X64AddressSpace};
+use crate::cancellation::CancellationToken;
+use crate::evidence::EvidenceLimit;
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 use crate::windows::gui_plugins::{WindowStationRecord, window_stations};
 use crate::windows::{ProcessRecord, WindowsKernelContext, list_processes};
+
+mod history;
+mod history_layout;
+pub use history::{ClipboardHistoryCheck, ClipboardHistoryRecord, HistoryChain, HistoryRange};
 
 const SCAN_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const SCAN_OVERLAP: usize = 512;
@@ -25,6 +31,7 @@ pub enum ClipboardScanStage {
     Structures,
     PhysicalScan,
     DataRecovery,
+    HistoryRecovery,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +134,12 @@ pub struct ClipboardTextRecord {
 #[derive(Debug, Serialize)]
 pub struct ClipboardScanReport {
     pub formats: Vec<ClipboardFormatRecord>,
+    pub history: Vec<ClipboardHistoryRecord>,
+    pub history_checks: Vec<ClipboardHistoryCheck>,
+    pub history_scope: &'static str,
+    pub history_complete: bool,
+    pub history_seconds: f64,
+    pub limits: Vec<EvidenceLimit>,
     pub window_stations_examined: usize,
     pub clip_arrays_validated: usize,
     pub structured_data_blocks: usize,
@@ -250,11 +263,33 @@ pub fn scan_clipboard<F>(
     kernel: &WindowsKernelContext,
     profile: &KernelProfile,
     options: &ClipboardScanOptions,
+    progress: F,
+) -> Result<ClipboardScanReport>
+where
+    F: FnMut(ClipboardScanStage),
+{
+    scan_clipboard_cancellable(
+        image,
+        kernel,
+        profile,
+        options,
+        &CancellationToken::new(),
+        progress,
+    )
+}
+
+pub fn scan_clipboard_cancellable<F>(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    options: &ClipboardScanOptions,
+    cancellation: &CancellationToken,
     mut progress: F,
 ) -> Result<ClipboardScanReport>
 where
     F: FnMut(ClipboardScanStage),
 {
+    cancellation.check_cancelled()?;
     ensure!(options.limit > 0, "剪切板结果上限必须大于零");
     ensure!(options.max_data_size > 0, "剪切板数据恢复上限必须大于零");
 
@@ -264,14 +299,25 @@ where
 
     progress(ClipboardScanStage::Structures);
     let structure_started = Instant::now();
-    let station_report = window_stations(image, kernel, profile, 4096)?;
-    complete &= station_report.complete;
-    warnings.extend(
-        station_report
-            .warnings
-            .iter()
-            .map(|warning| format!("窗口站：{warning}")),
-    );
+    // User-mode history remains recoverable when the kernel clipboard source is unavailable.
+    let stations = match window_stations(image, kernel, profile, 4096) {
+        Ok(report) => {
+            complete &= report.complete;
+            warnings.extend(
+                report
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("窗口站：{warning}")),
+            );
+            report.records
+        }
+        Err(error) => {
+            complete = false;
+            warnings.push(format!("活动剪贴板窗口站不可用：{error:#}"));
+            Vec::new()
+        }
+    };
+    cancellation.check_cancelled()?;
     let processes = list_processes(image, kernel, profile, 65_536)?;
     complete &= processes.complete;
     warnings.extend(
@@ -283,7 +329,8 @@ where
     let sessions = select_session_spaces(&processes.processes);
     let mut structured = Vec::new();
     let mut clip_arrays_validated = 0usize;
-    for station in &station_report.records {
+    for station in &stations {
+        cancellation.check_cancelled()?;
         let Some(session) = sessions
             .iter()
             .find(|session| session.session_id == station.session_id)
@@ -335,6 +382,7 @@ where
             pool_tags: true,
             residual_text: false,
         },
+        cancellation,
     )?;
     let raw_pool_tag_hits = physical.pool_tags.len();
 
@@ -351,6 +399,7 @@ where
         &referenced_handles,
         options.max_data_size,
     );
+    cancellation.check_cancelled()?;
     let structured_data_blocks = blocks.len();
     let mut formats = structured
         .into_iter()
@@ -374,9 +423,40 @@ where
         );
     }
 
+    progress(ClipboardScanStage::HistoryRecovery);
+    let history_started = Instant::now();
+    let history = history::scan_history(
+        image,
+        kernel,
+        profile,
+        &processes.processes,
+        options,
+        cancellation,
+    )?;
+    complete &= history.complete;
+    for check in &history.checks {
+        if !check.complete {
+            push_warning(
+                &mut warnings,
+                format!(
+                    "TextInputHost 历史 PID {}：{}（详见历史来源检查）",
+                    check
+                        .pid
+                        .map_or_else(|| "—".to_owned(), |pid| pid.to_string()),
+                    check.warnings.join("；")
+                ),
+            );
+        }
+    }
     Ok(ClipboardScanReport {
         formats,
-        window_stations_examined: station_report.records.len(),
+        history: history.items,
+        history_checks: history.checks,
+        history_scope: history::HISTORY_SCOPE,
+        history_complete: history.complete && processes.complete,
+        history_seconds: history_started.elapsed().as_secs_f64(),
+        limits: history.limits,
+        window_stations_examined: stations.len(),
         clip_arrays_validated,
         structured_data_blocks,
         raw_pool_tag_hits,
@@ -421,6 +501,7 @@ where
             pool_tags: false,
             residual_text: true,
         },
+        &CancellationToken::new(),
     )?;
     let raw_email_candidates = physical
         .residuals
@@ -918,9 +999,19 @@ fn scan_physical_candidates(
     image: &MemoryImage,
     exact_patterns: &[ExactTextPattern],
     mode: PhysicalScanMode,
+    cancellation: &CancellationToken,
 ) -> Result<PhysicalScanResult> {
+    cancellation.check_cancelled()?;
     let work = scan_work(image)?;
-    let direct = image.direct_bytes();
+    // Scanning a RAW image through the persistent mmap faults the whole image
+    // into the host working set. A large clipboard scan then trips Lovelymem's
+    // memory guard even though the returned evidence is tiny. Uscb scanning
+    // uses bounded reads (positional file reads on Windows) instead.
+    let direct = if mode.pool_tags {
+        None
+    } else {
+        image.direct_bytes()
+    };
     let pattern_scanner = mode
         .residual_text
         .then(|| prepare_pattern_scanner(exact_patterns))
@@ -929,6 +1020,7 @@ fn scan_physical_candidates(
     let partial = work
         .par_iter()
         .map(|work| -> Result<PhysicalScanPartial> {
+            cancellation.check_cancelled()?;
             let mut buffered = Vec::new();
             let bytes = if let Some(direct) = direct {
                 let start = usize::try_from(work.file_start)?;
@@ -1004,6 +1096,7 @@ fn scan_physical_candidates(
                     &mut candidates,
                 );
             }
+            cancellation.check_cancelled()?;
             Ok((tags, candidates))
         })
         .collect::<Result<Vec<_>>>()?;

@@ -149,10 +149,7 @@ pub fn parse_xen_elf64_with_limits(
     let machine = read_u16(bytes, 18)?;
     ensure!(machine == EM_X86_64, "首版仅支持 x86-64 Xen dump-core");
     ensure!(read_u32(bytes, 20)? == 1, "ELF header version 无效");
-    ensure!(
-        usize::from(read_u16(bytes, 52)?) >= ELF64_HEADER_SIZE,
-        "ELF64 header size 无效"
-    );
+    // e_ehsize 不参与解析；VirtualBox 等写入器会写错该字段，不能因此阻断后续格式探测。
 
     let (sections, names_index) =
         parse_section_headers(bytes, file_length, limits.max_section_headers)?;

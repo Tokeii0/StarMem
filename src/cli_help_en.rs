@@ -60,6 +60,185 @@ fn translate_value_name(name: &str) -> Option<&'static str> {
 
 fn translate(text: &str) -> &str {
     match text {
+        "AI 客户端本地会话与进程内存分析。" => {
+            "Analyze local AI client sessions and process memory."
+        }
+        "仅保留包含该文本的字符串（大小写不敏感）。" => {
+            "Keep only strings containing this text (case-insensitive)."
+        }
+        "仅执行指定类别，可重复或逗号分隔；默认全部。" => {
+            "Run only these categories; repeat or separate with commas. Defaults to all."
+        }
+        "仅核对指定 PID；默认识别活动 QQ.exe 进程" => {
+            "Inspect only this PID. Defaults to active QQ.exe processes."
+        }
+        "仅核对指定 PID；默认识别活动 Weixin.exe / WeChat.exe" => {
+            "Inspect only this PID. Defaults to active Weixin.exe / WeChat.exe processes."
+        }
+        "从 Chromium History 与 Firefox places.sqlite 恢复 URL 概要及逐次访问事件。" => {
+            "Recover URL summaries and individual visits from Chromium History and Firefox places.sqlite."
+        }
+        "从内核 PDB 生成精简符号配置；.ssym 输出为实验性二进制，其余为 JSON。" => {
+            "Generate a compact kernel profile from a PDB. The .ssym extension selects experimental binary output; otherwise use JSON."
+        }
+        "从已核验的无符号 FILE_OBJECT 恢复驻留内容并保存范围说明。" => {
+            "Recover resident content from a validated symbol-free FILE_OBJECT and save coverage metadata."
+        }
+        "从微信驻留 WCDB 缓存恢复聊天正文、发送者、联系人和会话摘要。" => {
+            "Recover message text, senders, contacts, and session summaries from resident WeChat WCDB caches."
+        }
+        "从指定物理字节的 PFN 和原型 PTE 反查数据节文件对象与文件内偏移。" => {
+            "Resolve a physical byte through its PFN and prototype PTE to a data-section file object and file offset."
+        }
+        "从显式选择的 Hive 文件对象解析注册表与离线凭据；仅手动执行。" => {
+            "Parse registry data and offline credentials from explicitly selected hive file objects. Manual execution only."
+        }
+        "全部消息的总字节预算（硬上限 64 MiB）。" => {
+            "Total byte budget for all messages (hard maximum: 64 MiB)."
+        }
+        "关联浏览器窗口、驻留 URL 与 Session 片段，保留页面和标签页线索的来源。" => {
+            "Correlate browser windows, resident URLs, and session fragments while preserving page and tab provenance."
+        }
+        "分析 AnyDesk 进程、网络、本机标识及连接请求日志。" => {
+            "Analyze AnyDesk processes, network evidence, local identifiers, and connection request logs."
+        }
+        "分析 WPS 进程、网络、最近文档及驻留配置与日志。" => {
+            "Analyze WPS processes, network evidence, recent documents, and resident configuration and logs."
+        }
+        "分析前台焦点、编辑控件、输入法、剪贴板、浏览器会话、Explorer 与通知痕迹。" => {
+            "Analyze foreground focus, edit controls, input methods, clipboard, browser sessions, Explorer, and notification traces."
+        }
+        "分析向日葵/AweSun 进程、网络及驻留配置与日志。" => {
+            "Analyze Sunlogin/AweSun processes, network evidence, and resident configuration and logs."
+        }
+        "单个 History / places.sqlite 数据库允许恢复的最大大小，单位为 MiB" => {
+            "Maximum recovered size per History / places.sqlite database, in MiB."
+        }
+        "单个区域允许扫描的最大字节数。" => {
+            "Maximum bytes scanned in a single region."
+        }
+        "单个浏览器数据库或账号 JSON 文件的最大恢复大小，单位为 MiB" => {
+            "Maximum recovered size per browser database or account JSON file, in MiB."
+        }
+        "单条字符串保留的最大字符数。" => "Maximum characters retained per string.",
+        "单条消息的最大恢复字节数（硬上限 16 MiB）。" => {
+            "Maximum recovered bytes per message (hard maximum: 16 MiB)."
+        }
+        "各阶段最多恢复和解析的浏览器数据库或账号 JSON 文件数量" => {
+            "Maximum browser databases or account JSON files recovered and parsed per stage."
+        }
+        "已有的 JSON 或实验性 .ssym 符号配置文件" => {
+            "Existing JSON or experimental .ssym symbol profile."
+        }
+        "应用路径筛选后的 FILE_OBJECT 上限（1–16384）。" => {
+            "FILE_OBJECT limit after filtering application paths (1-16384)."
+        }
+        "当前 Linux 镜像的 System.map；验证地址后从本地精确 ISF 自动补齐类型，无类型来源时仅提供基础进程" => {
+            "System.map for this Linux image. Validate addresses and supplement types from an exact local ISF; without types, provide only basic process analysis."
+        }
+        "恢复 QQNT 进程中的消息片段、联系人资料、附件传输和客户端日志。" => {
+            "Recover message fragments, contacts, attachment transfers, and client logs from QQNT processes."
+        }
+        "恢复活动剪贴板格式及经符号布局验证的 TextInputHost 驻留历史。" => {
+            "Recover active clipboard formats and resident TextInputHost history validated against exact symbol layouts."
+        }
+        "扫描的区域，可重复或逗号分隔；默认 heap,stack。" => {
+            "Regions to scan; repeat or separate with commas. Defaults to heap,stack."
+        }
+        "按 vnode/UBC/vm_object 归属恢复 macOS 驻留文件页；缺页使用 .partial 产物。" => {
+            "Recover resident macOS file pages through vnode/UBC/vm_object ownership. Use .partial outputs when pages are missing."
+        }
+        "按会话恢复最近最多 64 个鼠标位置，保留环内顺序、时钟限制和原始地址。" => {
+            "Recover up to 64 recent mouse positions per session, preserving ring order, clock limitations, and original addresses."
+        }
+        "提取 Linux 进程堆、栈及可选匿名可写映射中驻留页面的 UTF-8/UTF-16LE 字符串，并给出虚拟地址。" => {
+            "Extract UTF-8/UTF-16LE strings with virtual addresses from resident Linux process heaps, stacks, and optional anonymous writable mappings."
+        }
+        "提取的字符串编码。" => "String encodings to extract.",
+        "文本模式的内存编码；十六进制模式保留原始字节语义。" => {
+            "Memory encoding for text mode. Hex mode preserves raw byte semantics."
+        }
+        "无外部调试符号的基础系统信息；字段保留来源、缺失及估算说明。" => {
+            "Recover basic system information without external debug symbols, preserving provenance, missing fields, and estimation details."
+        }
+        "无外部调试符号的基础进程分析（实验性，仅手动执行）。" => {
+            "Basic process analysis without external debug symbols (experimental, manual execution only)."
+        }
+        "无外部调试符号的文件对象扫描（实验性，仅手动执行）。" => {
+            "Scan file objects without external debug symbols (experimental, manual execution only)."
+        }
+        "无符号进程 DLL：逐进程恢复原生 AMD64 加载器模块链，保留缺页和核验状态。" => {
+            "Recover native AMD64 loader module lists per process without symbols, preserving missing pages and validation status."
+        }
+        "无符号进程上下文：恢复原生 AMD64 命令行、映像路径及环境变量。" => {
+            "Recover native AMD64 command lines, image paths, and environment variables without symbols."
+        }
+        "最多保留的 SQLite 文件头物理锚点数" => {
+            "Maximum physical SQLite header anchors retained."
+        }
+        "最多恢复和解析的 Chromium History / Firefox places.sqlite 数据库数量" => {
+            "Maximum Chromium History / Firefox places.sqlite databases recovered and parsed."
+        }
+        "最多核对内容的 FILE_OBJECT 数（1–128）。" => {
+            "Maximum FILE_OBJECT records whose content is inspected (1-128)."
+        }
+        "最多核对的微信进程地址空间数" => {
+            "Maximum WeChat process address spaces inspected."
+        }
+        "最多检查的 QQ 进程地址空间数" => {
+            "Maximum QQ process address spaces inspected."
+        }
+        "最多解析的独立数据库缓存数" => "Maximum independent database caches parsed.",
+        "最少字符数。" => "Minimum character count.",
+        "根据显式 macOS 符号与驻留内核链分析系统、进程和文件（OS X 10.8–10.11，x86-64）。" => {
+            "Analyze system, process, and file evidence using explicit macOS symbols and resident kernel lists (OS X 10.8-10.11, x86-64)."
+        }
+        "检测 BitLocker 组件、恢复密钥文件线索与驻留文本，不推定卷状态。" => {
+            "Detect BitLocker components, recovery-key file traces, and resident text without inferring volume state."
+        }
+        "检测 VeraCrypt 进程、驱动、容器候选与挂载历史配置。" => {
+            "Detect VeraCrypt processes, drivers, container candidates, and mount-history configuration."
+        }
+        "每个命中前后各读取的原始上下文字节；0 关闭，最多 4096。" => {
+            "Raw context bytes read before and after each hit; 0 disables context, maximum 4096."
+        }
+        "每个缓存最多核对的页节点数" => "Maximum page nodes inspected per cache.",
+        "每个进程的实际驻留读取预算（MiB），不遍历空洞大小。" => {
+            "Resident read budget per process, in MiB; holes do not consume the budget."
+        }
+        "每个驻留文件的最大恢复大小，单位 MiB。" => {
+            "Maximum recovered size per resident file, in MiB."
+        }
+        "每个驻留文件的最大读取大小，MiB（1–16）。" => {
+            "Maximum read size per resident file, in MiB (1-16)."
+        }
+        "每类 QQNT 结构签名最多保留的物理锚点数" => {
+            "Maximum physical anchors retained per QQNT structure signature."
+        }
+        "火绒报毒、隔离与驻留日志分析。" => {
+            "Analyze Huorong detections, quarantine records, and resident logs."
+        }
+        "物理地址（不是镜像文件偏移），支持十进制与 0x 十六进制。" => {
+            "Physical address, not an image file offset. Accepts decimal and 0x hexadecimal."
+        }
+        "聚合浏览器进程、Cookie、Chromium/Firefox 历史、下载与账号元数据，重建可验证的会话证据。" => {
+            "Aggregate browser processes, cookies, Chromium/Firefox history, downloads, and account metadata into verifiable session evidence."
+        }
+        "跨全部独立队列最多检查的消息条数。" => {
+            "Maximum messages inspected across all independent queues."
+        }
+        "路径筛选后最多恢复的文件候选数。" => {
+            "Maximum file candidates recovered after path filtering."
+        }
+        "跳过进程内存，仅分析文件与元数据。" => {
+            "Skip process memory and analyze only files and metadata."
+        }
+        "输出 URL 聚合摘要，或 visits / moz_historyvisits 表中的逐次访问事件。" => {
+            "Output URL summaries or individual visits from visits / moz_historyvisits tables."
+        }
+        "验证 MSFS mailslot 端点、关联进程句柄，并恢复支持布局的队列消息。" => {
+            "Validate MSFS mailslot endpoints, correlate process handles, and recover queued messages for supported layouts."
+        }
         "--object 模式跨全部进程最多检查的句柄表项数。" => {
             "Maximum handle table entries to inspect across all processes in --object mode."
         }
@@ -824,6 +1003,9 @@ fn translate(text: &str) -> &str {
         "禁止任何远程访问。" => "Disable all remote access.",
         "禁用交互终端中的动态分析进度条" => {
             "Disable interactive analysis progress bars."
+        }
+        "显示终端警告；默认隐藏，JSON/CSV 报告始终保留警告记录" => {
+            "Show terminal warnings (hidden by default). JSON/CSV reports always retain warnings."
         }
         "符号来源：kernel 表示内核模块，processes 表示进程模块" => {
             "Symbol source: kernel for kernel modules, or processes for process modules."

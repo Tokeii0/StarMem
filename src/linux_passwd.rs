@@ -1367,6 +1367,7 @@ not-a-passwd-record\n";
             task_struct_size: 0,
             task_struct_offsets: Default::default(),
             symbol_table: None,
+            system_map: None,
         }
     }
 

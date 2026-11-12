@@ -57,6 +57,91 @@ pub struct ScanReport {
     pub gib_per_second: f64,
     pub hits: Vec<ScanHit>,
     pub truncated: bool,
+    pub complete: bool,
+    pub scope: &'static str,
+    pub limit: usize,
+    pub limit_reached: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<ScanContext>,
+    pub context_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanContext {
+    pub match_physical_address: u64,
+    pub match_byte_length: usize,
+    pub physical_start: u64,
+    pub byte_length: usize,
+    pub source_location: Option<crate::image::SourceLocation>,
+    pub bytes_hex: String,
+    pub utf8_lossy: String,
+    pub utf16le_physical_start: u64,
+    pub utf16le_lossy: String,
+}
+
+impl ScanReport {
+    /// Bounded raw previews, clipped to the hit's contiguous acquired range.
+    /// Decoded previews are conveniences; bytes_hex remains the evidence.
+    pub fn add_context(
+        &mut self,
+        image: &MemoryImage,
+        needle_length: usize,
+        radius: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        ensure!(radius <= 4096, "上下文单侧最多读取 4096 字节");
+        if radius == 0 {
+            return Ok(());
+        }
+        const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+        let mut retained = 0usize;
+        let ranges = acquired_ranges(image);
+        for hit in &self.hits {
+            cancellation.check_cancelled()?;
+            let &(range_start, range_length) = ranges
+                .iter()
+                .find(|&&(start, length)| {
+                    hit.physical_address >= start
+                        && hit.physical_address < start.saturating_add(length)
+                })
+                .context("扫描命中不在已采集物理区间内")?;
+            let start = hit
+                .physical_address
+                .saturating_sub(radius as u64)
+                .max(range_start);
+            let end = hit
+                .physical_address
+                .saturating_add(needle_length as u64)
+                .saturating_add(radius as u64)
+                .min(range_start.saturating_add(range_length));
+            let length = usize::try_from(end - start)?;
+            if retained.saturating_add(length) > MAX_CONTEXT_BYTES {
+                self.context_truncated = true;
+                self.complete = false;
+                break;
+            }
+            let mut bytes = vec![0; length];
+            image.read_physical(start, &mut bytes)?;
+            let utf16_start = (start & 1) as usize;
+            let words: Vec<u16> = bytes[utf16_start..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            self.contexts.push(ScanContext {
+                match_physical_address: hit.physical_address,
+                match_byte_length: needle_length,
+                physical_start: start,
+                byte_length: length,
+                source_location: image.source_location(start),
+                bytes_hex: hex::encode(&bytes),
+                utf8_lossy: String::from_utf8_lossy(&bytes).into_owned(),
+                utf16le_physical_start: start + utf16_start as u64,
+                utf16le_lossy: String::from_utf16_lossy(&words),
+            });
+            retained += length;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,7 +203,7 @@ impl ScanEngine {
         }
     }
 
-    fn lock_physical_scan(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+    pub(crate) fn lock_physical_scan(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.inner
             .physical_scan_gate
             .lock()
@@ -146,6 +231,16 @@ impl ScanEngine {
         chunk_size: usize,
         cancellation: &CancellationToken,
     ) -> Result<MultiScanReport> {
+        if image.is_live() {
+            let _scan_guard = self.lock_physical_scan()?;
+            return scan_exact_4_cpu_cancellable(
+                image,
+                patterns,
+                limit_per_pattern,
+                chunk_size,
+                cancellation,
+            );
+        }
         if let Some(report) = self.cached_fixed_scan(patterns, limit_per_pattern)? {
             cancellation.check_cancelled()?;
             return Ok(report);
@@ -801,12 +896,19 @@ fn scan_exact_cpu_cancellable(
     let elapsed = started.elapsed();
     let bytes_scanned = scanned.load(Ordering::Relaxed);
     progress.finish();
+    let truncated =
+        stopped_early.load(Ordering::Relaxed) || seen.load(Ordering::Relaxed) > hits.len();
     Ok(ScanReport {
         bytes_scanned,
         elapsed_seconds: duration_seconds(elapsed),
         gib_per_second: throughput(bytes_scanned, elapsed),
-        truncated: stopped_early.load(Ordering::Relaxed)
-            || seen.load(Ordering::Relaxed) > hits.len(),
+        truncated,
+        complete: !truncated && bytes_scanned == total_bytes,
+        scope: "已采集且可读取的物理区间中的精确字节；不包含未采集页、交换区或进程/文件归属推断",
+        limit,
+        limit_reached: truncated,
+        contexts: Vec::new(),
+        context_truncated: false,
         hits,
     })
 }
@@ -1176,5 +1278,34 @@ mod tests {
             &[*b"Proc", *b"File"],
             4 * 1024 * 1024
         ));
+    }
+
+    #[test]
+    fn precise_scan_declares_scope_and_keeps_bounded_raw_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text.raw");
+        fs::write(&path, b"xxsecret=abc\0tail secret=def").unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let mut report = scan_exact(&image, b"secret", 10, 7).unwrap();
+        assert!(report.complete);
+        assert!(!report.limit_reached);
+        report
+            .add_context(&image, 6, 5, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(report.contexts.len(), 2);
+        assert_eq!(report.contexts[0].physical_start, 0);
+        assert!(report.contexts[0].utf8_lossy.contains("secret=abc"));
+        assert_eq!(
+            hex::decode(&report.contexts[0].bytes_hex).unwrap().len(),
+            report.contexts[0].byte_length
+        );
+        let limited = scan_exact(&image, b"secret", 1, 7).unwrap();
+        assert!(!limited.complete);
+        assert!(limited.limit_reached);
+        assert!(
+            report
+                .add_context(&image, 6, 4097, &CancellationToken::new())
+                .is_err()
+        );
     }
 }

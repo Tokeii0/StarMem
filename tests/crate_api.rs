@@ -30,6 +30,13 @@ fn stable_facade_exposes_catalog_and_serializable_requests() {
     let catalog = command_catalog().unwrap();
     assert!(catalog.by_id("pslist").is_some());
     assert!(catalog.by_id("windows.process-string").is_some());
+    assert!(catalog.by_id("mouse-history").is_some());
+    assert!(
+        capabilities
+            .runnable_command_ids
+            .iter()
+            .any(|id| id == "mouse-history")
+    );
 
     let arguments = to_value(ProcessStringArguments::new("StarMem"))
         .unwrap()

@@ -59,13 +59,10 @@ pub(super) fn parse_elf_physical_core(bytes: &[u8], file_length: u64) -> Result<
     ensure!(machine == EM_X86_64, "仅支持 x86-64 ELF physical core");
     ensure!(read_u32(bytes, 20)? == 1, "ELF header version 无效");
     let program_offset = read_u64(bytes, 32)?;
-    let header_size = read_u16(bytes, 52)?;
+    // ELF64 头布局固定；VirtualBox dumpvmcore 等写入器会把 e_ehsize 写错（如 8），
+    // 后续解析不依赖该字段，因此不据此拒绝镜像。
     let program_entry_size = read_u16(bytes, 54)?;
     let program_count = read_u16(bytes, 56)?;
-    ensure!(
-        usize::from(header_size) >= ELF_HEADER_SIZE,
-        "ELF header size 无效"
-    );
     ensure!(
         usize::from(program_entry_size) >= ELF_PROGRAM_HEADER64_SIZE,
         "ELF64 program header size 无效"
@@ -303,6 +300,14 @@ mod tests {
                 .producer,
             ElfProducerHint::Qemu
         );
+    }
+
+    #[test]
+    fn tolerates_bogus_e_ehsize_from_real_writers() {
+        let mut bytes = fixture(b"VBOX", false);
+        put_u16(&mut bytes, 52, 8);
+        let parsed = parse_elf_physical_core(&bytes, bytes.len() as u64).unwrap();
+        assert_eq!(parsed.regions.len(), 2);
     }
 
     #[test]

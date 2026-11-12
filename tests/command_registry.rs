@@ -24,7 +24,7 @@ const LINUX_METADATA_COMMANDS: [&str; 8] = [
 fn embedded_registry_covers_all_leaf_commands() {
     let registry = CommandRegistry::load_embedded().expect("embedded registry must validate");
     assert_eq!(registry.len(), EMBEDDED_LEAF_COMMAND_COUNT);
-    assert_eq!(registry.len(), 155);
+    assert_eq!(registry.len(), 179);
     assert!(!registry.is_empty());
 
     let ids = registry.command_ids().collect::<Vec<_>>();
@@ -39,6 +39,87 @@ fn embedded_registry_covers_all_leaf_commands() {
     assert!(ids.contains(&"linux.check-syscall"));
     assert!(ids.contains(&"windows.process-string"));
     assert!(ids.contains(&"windows.open-files"));
+    assert!(ids.contains(&"mouse-history"));
+    assert!(ids.contains(&"qqscan"));
+    for name in [
+        "bitlocker",
+        "veracrypt",
+        "sunlogin",
+        "anydesk",
+        "wps",
+        "huorong",
+        "ai-chat",
+    ] {
+        let contract = registry.by_id(name).expect("应用分析命令应可发现");
+        assert!(contract.collect_parameterized);
+        assert_eq!(contract.collect_disposition, CollectDisposition::Skipped);
+    }
+}
+
+#[test]
+fn qqscan_is_available_to_manual_hosts_but_skipped_by_collect() {
+    let registry = CommandRegistry::load_embedded().unwrap();
+    let contract = registry.by_id("qqscan").unwrap();
+    assert!(contract.collect_parameterized);
+    assert_eq!(contract.collect_disposition, CollectDisposition::Skipped);
+    assert_eq!(contract.cli_path, ["qqscan"]);
+    for name in ["pid", "limit", "anchor-limit", "process-space-limit"] {
+        assert!(
+            contract
+                .arguments
+                .items
+                .iter()
+                .any(|a| a.name == name && a.required == Some(false))
+        );
+    }
+}
+
+#[test]
+fn symbolless_commands_have_no_symbol_inputs_and_are_manual_only() {
+    let registry = CommandRegistry::load_embedded().unwrap();
+    for name in [
+        "symbolless.system-info",
+        "symbolless.pslist",
+        "symbolless.process-context",
+        "symbolless.process-modules",
+        "symbolless.filescan",
+        "symbolless.dumpfile",
+        "symbolless.registry",
+    ] {
+        let contract = registry.by_id(name).unwrap();
+        assert!(contract.collect_parameterized);
+        assert_eq!(contract.collect_disposition, CollectDisposition::Skipped);
+        assert!(
+            contract
+                .input_roles
+                .roles
+                .iter()
+                .all(|r| r.role != InputRole::Pdb && r.role != InputRole::SymbolStore)
+        );
+        assert!(
+            contract
+                .arguments
+                .items
+                .iter()
+                .all(|a| !["pdb", "profile", "symbol-path", "cache"].contains(&a.name.as_str()))
+        );
+    }
+}
+
+#[test]
+fn mouse_history_is_a_bounded_windows_command_without_a_volatility_equivalent() {
+    let registry = CommandRegistry::load_embedded().unwrap();
+    let contract = registry.by_id("mouse-history").unwrap();
+    assert_eq!(contract.cli_path, ["mouse-history"]);
+    assert_eq!(contract.equivalence.status, EquivalenceStatus::NoEquivalent);
+    assert!(contract.arguments.items.iter().any(|a| a.name == "limit"));
+    assert!(
+        contract
+            .input_roles
+            .roles
+            .iter()
+            .any(|r| r.role == InputRole::MemoryImage && r.required == Some(true))
+    );
 }
 
 #[test]
@@ -172,15 +253,24 @@ fn linux_kernel_contracts_preserve_known_io_evidence_and_collect_metadata() {
             Some(true),
             "{command_id}"
         );
-        assert_eq!(contract.arguments.items[1].name, "cache", "{command_id}");
         assert_eq!(
-            contract.arguments.items[2].name, "symbol-path",
+            contract.arguments.items[1].name, "system-map",
             "{command_id}"
         );
-        assert_eq!(contract.arguments.items[2].repeatable, Some(true));
-        assert_eq!(contract.arguments.items[3].name, "dtb", "{command_id}");
         assert_eq!(
-            contract.arguments.items[4].name, "kernel-slide",
+            contract.arguments.items[1].value_type,
+            ArgumentValueType::Path
+        );
+        assert_eq!(contract.arguments.items[1].required, Some(false));
+        assert_eq!(contract.arguments.items[2].name, "cache", "{command_id}");
+        assert_eq!(
+            contract.arguments.items[3].name, "symbol-path",
+            "{command_id}"
+        );
+        assert_eq!(contract.arguments.items[3].repeatable, Some(true));
+        assert_eq!(contract.arguments.items[4].name, "dtb", "{command_id}");
+        assert_eq!(
+            contract.arguments.items[5].name, "kernel-slide",
             "{command_id}"
         );
         assert_eq!(
@@ -316,6 +406,7 @@ fn windows_process_string_declares_parameterized_process_memory_evidence() {
             "encoding",
             "profile",
             "pdb",
+            "system-map",
             "cache",
             "symbol-path",
             "scan-hit-limit",
@@ -398,7 +489,7 @@ fn linux_symbol_contract_preserves_the_explicit_known_metadata() {
     let contract = registry.by_id("symbols.linux").unwrap();
     assert_eq!(contract.help.status, MetadataStatus::Known);
     assert_eq!(contract.arguments.status, MetadataStatus::Known);
-    assert_eq!(contract.arguments.items.len(), 9);
+    assert_eq!(contract.arguments.items.len(), 10);
     assert_eq!(contract.arguments.items[0].name, "image");
     assert_eq!(contract.arguments.items[0].required, Some(true));
     let isf = contract

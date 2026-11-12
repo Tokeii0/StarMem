@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail, ensure};
 use pdb::{FallibleIterator, TypeData, TypeFinder, TypeIndex};
 use serde::{Deserialize, Serialize};
 
+pub mod compiled;
+
 const PROFILE_TYPES: &[&str] = &[
     "_EPROCESS",
     "_KPROCESS",
@@ -78,6 +80,13 @@ const PROFILE_TYPES: &[&str] = &[
     "_MMPTE_HARDWARE",
     "_MMPTE_SOFTWARE",
     "_MMPTE_TRANSITION",
+    "_MMPFN",
+    "_MMPTE_SUBSECTION",
+    "_MI_SYSTEM_INFORMATION",
+    "_MI_HARDWARE_STATE",
+    "_MI_PARTITION",
+    "_MI_VISIBLE_PARTITION",
+    "_MMPAGING_FILE",
     "_KLDR_DATA_TABLE_ENTRY",
     "_LDR_DATA_TABLE_ENTRY",
     "_MM_AVL_TABLE",
@@ -133,6 +142,9 @@ const PROFILE_SYMBOLS: &[&str] = &[
     "SeDebugPrivilege",
     "SeImpersonatePrivilege",
     "NtBuildNumber",
+    "MiState",
+    "MiSystemPartition",
+    "SmGlobals",
     "NtMajorVersion",
     "NtMinorVersion",
     "KeNumberProcessors",
@@ -141,6 +153,7 @@ const PROFILE_SYMBOLS: &[&str] = &[
     "PoolBigPageTable",
     "PoolBigPageTableSize",
     "MmPhysicalMemoryBlock",
+    "MmPfnDatabase",
     "MmSystemRangeStart",
     "MmHighestUserAddress",
     "MmAvailablePages",

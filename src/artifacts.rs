@@ -65,6 +65,9 @@ pub struct ArtifactExportRecord {
     /// `None` means that this artifact type has no reliable signature check yet.
     pub signature_valid: Option<bool>,
     pub signature_observed_hex: Option<String>,
+    /// Page reconstruction provenance for an exported live registry hive.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compressed_pages: Vec<crate::windows::compressed_store::CompressedPageEvidence>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
 }
@@ -152,18 +155,7 @@ pub fn export_artifacts(
         });
 
         let process_report = session.processes(65_536)?;
-        registry_process_dtb = process_report
-            .processes
-            .iter()
-            .find(|process| {
-                process.name.eq_ignore_ascii_case("Registry") && process.ppid == Some(4)
-            })
-            .and_then(|process| {
-                process
-                    .details
-                    .directory_table_base
-                    .or(process.details.user_directory_table_base)
-            });
+        registry_process_dtb = crate::system::registry::registry_process_dtb(&process_report);
         report_warnings.extend(
             process_report
                 .warnings
@@ -272,6 +264,7 @@ pub fn export_artifacts(
                     signature_expected: signature.expected,
                     signature_valid: signature.valid,
                     signature_observed_hex: signature.observed_hex,
+                    compressed_pages: recovery.compressed_pages,
                     warnings,
                     error,
                 });
@@ -298,6 +291,7 @@ pub fn export_artifacts(
                 signature_expected: Some("regf".to_owned()),
                 signature_valid: None,
                 signature_observed_hex: None,
+                compressed_pages: Vec::new(),
                 warnings: Vec::new(),
                 error: Some(format!("{error:#}")),
             }),
@@ -334,6 +328,7 @@ pub fn export_artifacts(
                 signature_observed_hex: None,
                 warnings: Vec::new(),
                 error: Some("no resident Cache/Data/Image recovery source".to_owned()),
+                compressed_pages: Vec::new(),
             });
             continue;
         }
@@ -393,6 +388,7 @@ pub fn export_artifacts(
                     signature_expected: signature.expected,
                     signature_valid: signature.valid,
                     signature_observed_hex: signature.observed_hex,
+                    compressed_pages: recovery.compressed_pages,
                     warnings,
                     error,
                 });
@@ -424,6 +420,7 @@ pub fn export_artifacts(
                     signature_observed_hex: None,
                     warnings: Vec::new(),
                     error: Some(format!("{error:#}")),
+                    compressed_pages: Vec::new(),
                 });
             }
         }

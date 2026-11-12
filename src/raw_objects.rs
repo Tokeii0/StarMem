@@ -153,6 +153,7 @@ pub fn extract_raw_objects(
         "usb-history" => adapt_usb_history(&mut adapter, data)?,
         "windows.recent-files" => adapt_windows_recent_files(&mut adapter, data)?,
         "browser-session" => adapt_browser_session(&mut adapter, data)?,
+        "clipboardscan" => adapt_clipboard_history(&mut adapter, data)?,
         "windows.process-string" => adapt_windows_process_string(&mut adapter, data)?,
         "linux.lsmod" => adapt_linux_lsmod(&mut adapter, data)?,
         "linux.module-extract" => adapt_linux_module_extract(&mut adapter, data)?,
@@ -179,6 +180,60 @@ struct RawObjectAdapter<'a> {
     report_missing_ranges: Vec<MissingRange>,
     objects: BTreeMap<String, RawObject>,
     aggregates: Vec<AggregateEvidence>,
+}
+
+fn adapt_clipboard_history(adapter: &mut RawObjectAdapter<'_>, data: &Value) -> Result<()> {
+    if let Some(formats) = data.get("formats") {
+        conservative_walk(adapter, formats, "data.formats")?;
+    }
+    for (index, record) in data
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(address) = record.get("item_address").and_then(json_u64) else {
+            continue;
+        };
+        let Some(pid) = record.get("pid").and_then(json_u64) else {
+            continue;
+        };
+        let Some(eprocess) = record.get("eprocess").and_then(json_u64) else {
+            continue;
+        };
+        let semantic_key = selected_key(
+            record,
+            "clipboard_history_item",
+            &["pid", "eprocess", "item_index", "item_id"],
+        )?;
+        let mut checks = BTreeMap::new();
+        for key in ["layout", "pdb_key", "text_status", "text_error"] {
+            if let Some(value) = record.get(key) {
+                checks.insert(key.to_owned(), value.clone());
+            }
+        }
+        if let Some(id) = adapter.insert(RawObjectSpec {
+            object_type: "windows.clipboard_history_item".to_owned(),
+            address_space: format!("process_virtual:pid={pid}:eprocess={eprocess:#x}"),
+            address,
+            semantic_key: semantic_key.clone(),
+            fields: canonical_value(record),
+            // The item chain is validated even when its text pages are absent. Text has its own status.
+            valid: (record.get("evidence_kind").and_then(Value::as_str)
+                == Some("textinputhost_clipboard_history"))
+            .then_some(true),
+            validation_method: "textinputhost_clipboard_chain_v1".to_owned(),
+            validation_checks: checks,
+            provenance_source: "TextInputHost ClipboardControl.Model.ClipboardItems".to_owned(),
+            locator: format!("data.history[{index}]"),
+            relation: "member_of_validated_clipboard_vector".to_owned(),
+            missing_ranges: Vec::new(),
+        })? {
+            adapter.aggregate("clipboard.history_item", semantic_key, vec![id]);
+        }
+    }
+    Ok(())
 }
 
 struct RawObjectSpec {
@@ -1599,6 +1654,39 @@ mod tests {
         let second = evidence_id(&source(), "windows.timeline", "event", 0x1234, "key").unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn clipboard_history_raw_objects_keep_process_ownership_and_text_read_status() {
+        let report = serde_json::json!({ "complete": false, "formats": [], "history": [
+            { "pid": 40, "eprocess": 0xffff800000001000u64, "item_address": 0x30000,
+              "evidence_kind": "textinputhost_clipboard_history", "text_status": "verified", "text": "example.test",
+              "chain": { "control_address": 0x10000 }, "sources": [{ "physical_address": 0x50000, "bytes_hex": "6100" }] },
+            { "pid": 50, "eprocess": 0xffff800000002000u64, "item_address": 0x30000,
+              "evidence_kind": "textinputhost_clipboard_history", "text_status": "unavailable", "text": null }
+        ] });
+        let bundle = extract_raw_objects("clipboardscan", &source(), &report).unwrap();
+        assert_eq!(bundle.objects.len(), 2);
+        assert_ne!(bundle.objects[0].evidence_id, bundle.objects[1].evidence_id);
+        assert_ne!(
+            bundle.objects[0].address_space,
+            bundle.objects[1].address_space
+        );
+        assert_eq!(bundle.aggregates.len(), 2);
+        let good = bundle
+            .objects
+            .iter()
+            .find(|o| o.fields["pid"] == 40)
+            .unwrap();
+        assert_eq!(good.fields["sources"][0]["bytes_hex"], "6100");
+        assert_eq!(good.validation.valid, Some(true));
+        let missing = bundle
+            .objects
+            .iter()
+            .find(|o| o.fields["pid"] == 50)
+            .unwrap();
+        assert_eq!(missing.validation.checks["text_status"], "unavailable");
+        assert!(missing.fields["text"].is_null());
     }
 
     #[test]

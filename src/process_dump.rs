@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::address::{VirtualAddressRegion, X64AddressSpace};
+use crate::address::VirtualAddressRegion;
 use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::output_policy::{OutputPolicy, OutputTarget};
@@ -87,9 +87,12 @@ pub fn dump_process_memory_with_force(
         .user_directory_table_base
         .or(process.details.directory_table_base)
         .with_context(|| format!("PID {pid} 缺少可用的页表基址"))?;
-    let space = X64AddressSpace::new(image, directory_table_base)?;
-    let mapping_report =
-        space.enumerate_mappings(VirtualAddressRegion::User, MAX_MAPPING_RECORDS)?;
+    let space = kernel.address_space_for_dtb(image, directory_table_base)?;
+    let mapping_report = space.enumerate_mappings_cancellable(
+        VirtualAddressRegion::User,
+        MAX_MAPPING_RECORDS,
+        cancellation,
+    )?;
 
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
     let mut recovered_bytes = 0u64;

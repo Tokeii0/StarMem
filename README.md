@@ -81,6 +81,8 @@ starmem linux.sockstat ./linux.lime --symbol-path /path/to/linux-isf/symbols
 
 ### 镜像格式
 
+0.2.2 已对齐 Lovelymem V3 引擎；新增能力、同步范围及实验性 macOS 命令见 [V3 同步记录](docs/V3_SYNC.md)。
+
 主要分析路径面向 **x86-64** 来宾系统。部分 Windows 命令可处理 x86 PAE，覆盖范围取决于插件。
 
 | 验证状态 | 格式 |
@@ -104,6 +106,7 @@ starmem linux.sockstat ./linux.lime --symbol-path /path/to/linux-isf/symbols
 | --- | --- |
 | JSON 报告 | `--json`。插件结果放在 `data`，外围字段遵循 [Evidence Envelope v1](schemas/evidence-envelope-v1.schema.json)。 |
 | CSV 表格 | `--csv <文件>`。报告按区段写为 UTF-8 CSV，`--csv -` 写到标准输出。 |
+| 终端警告 | 默认隐藏，使用 `--show-warnings` 显示；JSON/CSV 中的警告与完整性信息始终保留。 |
 | 原始证据对象 | `--json --raw-objects <文件.jsonl>`。受支持的对象按 `evidence_id` 排序。见 [Raw Object v1](schemas/raw-object-v1.schema.json)。 |
 | SQLite 批量采集 | `collect --db <文件>`。复用镜像上下文，运行适用于本次采集的只读插件。 |
 

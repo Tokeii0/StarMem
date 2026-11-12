@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 
-use crate::address::X64AddressSpace;
+use crate::address::WindowsAddressSpace;
 use crate::session::AnalysisSession;
 use crate::windows::files::{
     DumpSource, FileScanRecord, RecoveredExtent, recover_file_bytes, scan_files_matching,
@@ -383,8 +383,7 @@ where
 
     progress(TerminalHistoryStage::HistoryFiles);
     let history_file_started = Instant::now();
-    let kernel_space =
-        X64AddressSpace::new(session.image(), session.kernel().directory_table_base)?;
+    let kernel_space = session.kernel().address_space(session.image())?;
     let mut psreadline_files_parsed = 0usize;
     for file in candidates {
         if records.len() >= options.limit.saturating_mul(4) {
@@ -647,7 +646,9 @@ fn translate_process_address(
     dtb: Option<u64>,
     virtual_address: u64,
 ) -> Option<u64> {
-    let space = X64AddressSpace::new(session.image(), dtb?).ok()?;
+    let mut context = session.kernel().clone();
+    context.directory_table_base = dtb?;
+    let space = context.address_space(session.image()).ok()?;
     space.translate(virtual_address).ok()
 }
 
@@ -878,7 +879,7 @@ fn normalize_history_command(command: &str) -> Option<String> {
 
 fn recovery_physical_extents(
     extents: &[RecoveredExtent],
-    kernel_space: &X64AddressSpace<'_>,
+    kernel_space: &WindowsAddressSpace<'_>,
 ) -> Vec<RecoveredExtent> {
     let mut output = Vec::new();
     for extent in extents {

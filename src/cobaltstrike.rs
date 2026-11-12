@@ -16,7 +16,7 @@ use crate::address::{VirtualAddressRegion, VirtualMapping, X64AddressSpace};
 use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
-use crate::windows::plugins::{VadRecord, list_vads};
+use crate::windows::plugins::{VadRecord, list_vads_cancellable};
 use crate::windows::{ProcessRecord, WindowsKernelContext, list_processes};
 
 const PAGE_SIZE: u64 = 0x1000;
@@ -318,9 +318,17 @@ pub fn scan_cobaltstrike_configs(
             }
         };
         cancellation.check_cancelled()?;
-        let vads = match list_vads(image, kernel, profile, process.pid, 1_000_000) {
+        let vads = match list_vads_cancellable(
+            image,
+            kernel,
+            profile,
+            process.pid,
+            1_000_000,
+            cancellation,
+        ) {
             Ok(report) => report,
             Err(error) => {
+                cancellation.check_cancelled()?;
                 complete = false;
                 push_warning(
                     &mut warnings,
@@ -332,6 +340,9 @@ pub fn scan_cobaltstrike_configs(
         cancellation.check_cancelled()?;
         counters.vads += vads.records.len();
         complete &= vads.complete;
+        for warning in &vads.warnings {
+            push_warning(&mut warnings, format!("PID {}: {warning}", process.pid));
+        }
         for vad in &vads.records {
             cancellation.check_cancelled()?;
             if !valid_user_vad_range(vad.start, vad.end) {

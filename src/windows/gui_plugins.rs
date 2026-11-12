@@ -96,6 +96,8 @@ pub struct WindowRecord {
     pub visible: Option<bool>,
     pub window_rect: Option<WindowRect>,
     pub client_rect: Option<WindowRect>,
+    /// Address of the validated structure supplying style and rectangles.
+    pub geometry_address: Option<u64>,
     pub tree_depth: usize,
     pub z_order: usize,
     pub layout: String,
@@ -241,6 +243,40 @@ struct WindowCandidate {
     visible: Option<bool>,
     window_rect: Option<WindowRect>,
     client_rect: Option<WindowRect>,
+    geometry_address: Option<u64>,
+}
+
+struct WindowGeometry {
+    address: u64,
+    style: u32,
+    ex_style: u32,
+    window_rect: WindowRect,
+    client_rect: WindowRect,
+}
+
+// Modern tagWND separates its kernel links from the shared window state.
+// Both copied handle and state must agree before using the holder's geometry.
+fn decode_split_geometry(
+    handle: u64,
+    state: u64,
+    address: u64,
+    bytes: &[u8],
+) -> Option<WindowGeometry> {
+    if !is_kernel_pointer(address)
+        || bytes.len() < 0x78
+        || handle == 0
+        || u64::from_le_bytes(bytes[0..8].try_into().ok()?) != handle
+        || u64::from_le_bytes(bytes[8..16].try_into().ok()?) != state
+    {
+        return None;
+    }
+    Some(WindowGeometry {
+        address,
+        ex_style: u32::from_le_bytes(bytes[0x18..0x1c].try_into().ok()?),
+        style: u32::from_le_bytes(bytes[0x1c..0x20].try_into().ok()?),
+        window_rect: decode_window_rect(&bytes[0x58..0x68])?,
+        client_rect: decode_window_rect(&bytes[0x68..0x78])?,
+    })
 }
 
 const WINDOW_LAYOUTS: &[WindowLayout] = &[
@@ -1328,11 +1364,48 @@ fn decode_window(
             None
         }
         .filter(|pointer| *pointer > 0x1000);
-        let style = read_u32(space, address + layout.style);
-        let ex_style = read_u32(space, address + 0x30);
-        let visible = read_u32(space, address + 0x34).map(|state| state & 0x1000_0000 != 0);
-        let window_rect = read_window_rect(space, address + 0x70);
-        let client_rect = read_window_rect(space, address + 0x80);
+        let (style, ex_style, window_rect, client_rect, geometry_address) =
+            if let Some((holder_offset, _)) = layout.procedure_holder {
+                let geometry = space
+                    .read_u64(address + holder_offset)
+                    .ok()
+                    .and_then(|holder| {
+                        let mut bytes = [0; 0x78];
+                        space.read_virtual(holder, &mut bytes).ok()?;
+                        decode_split_geometry(
+                            space.read_u64(address).ok()?,
+                            space.read_u64(address + 0x30).ok()?,
+                            holder,
+                            &bytes,
+                        )
+                    });
+                geometry
+                    .map(|g| {
+                        (
+                            Some(g.style),
+                            Some(g.ex_style),
+                            Some(g.window_rect),
+                            Some(g.client_rect),
+                            Some(g.address),
+                        )
+                    })
+                    .unwrap_or((None, None, None, None, None))
+            } else {
+                (
+                    read_u32(space, address + layout.style),
+                    read_u32(space, address + layout.style - 4),
+                    read_window_rect(
+                        space,
+                        address + if layout.style == 0x34 { 0x70 } else { 0x80 },
+                    ),
+                    read_window_rect(
+                        space,
+                        address + if layout.style == 0x34 { 0x80 } else { 0x90 },
+                    ),
+                    Some(address),
+                )
+            };
+        let visible = style.map(|style| style & 0x1000_0000 != 0);
         let linked_neighbors = [next, parent, child]
             .into_iter()
             .filter(|pointer| {
@@ -1363,6 +1436,7 @@ fn decode_window(
                 visible,
                 window_rect,
                 client_rect,
+                geometry_address,
             });
         }
     }
@@ -1387,6 +1461,7 @@ fn decode_window(
         visible: candidate.visible,
         window_rect: candidate.window_rect,
         client_rect: candidate.client_rect,
+        geometry_address: candidate.geometry_address,
         tree_depth: 0,
         z_order: 0,
         layout: candidate.layout.name.to_owned(),
@@ -1600,6 +1675,13 @@ fn read_u32(space: &X64AddressSpace<'_>, address: u64) -> Option<u32> {
 fn read_window_rect(space: &X64AddressSpace<'_>, address: u64) -> Option<WindowRect> {
     let mut bytes = [0u8; 16];
     space.read_virtual(address, &mut bytes).ok()?;
+    decode_window_rect(&bytes)
+}
+
+fn decode_window_rect(bytes: &[u8]) -> Option<WindowRect> {
+    if bytes.len() < 16 {
+        return None;
+    }
     let rect = WindowRect {
         left: i32::from_le_bytes(bytes[0..4].try_into().ok()?),
         top: i32::from_le_bytes(bytes[4..8].try_into().ok()?),
@@ -1623,6 +1705,28 @@ fn read_window_rect(space: &X64AddressSpace<'_>, address: u64) -> Option<WindowR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_window_geometry_requires_matching_handle_and_state() {
+        let mut bytes = [0; 0x78];
+        bytes[0..8].copy_from_slice(&0x10004u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&0x10e0u64.to_le_bytes());
+        bytes[0x1c..0x20].copy_from_slice(&0x96000000u32.to_le_bytes());
+        for start in [0x58, 0x68] {
+            bytes[start + 8..start + 12].copy_from_slice(&2558i32.to_le_bytes());
+            bytes[start + 12..start + 16].copy_from_slice(&1328i32.to_le_bytes());
+        }
+        let address = 0xffff_a306_4bee_10e0;
+        let geometry = decode_split_geometry(0x10004, 0x10e0, address, &bytes).unwrap();
+        assert_eq!(geometry.window_rect.width(), 2558);
+        assert_eq!(geometry.window_rect.height(), 1328);
+        assert_ne!(geometry.style & 0x10000000, 0);
+        assert!(decode_split_geometry(0x10005, 0x10e0, address, &bytes).is_none());
+        assert!(decode_split_geometry(0x10004, 0x20e0, address, &bytes).is_none());
+        assert!(decode_split_geometry(0x10004, 0x10e0, 0, &bytes).is_none());
+        bytes[0x60..0x64].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(decode_split_geometry(0x10004, 0x10e0, address, &bytes).is_none());
+    }
 
     #[test]
     fn accepts_only_canonical_aligned_kernel_pointers() {
@@ -1670,6 +1774,7 @@ mod tests {
                 tree_depth: 0,
                 z_order: 0,
                 layout: "test".to_owned(),
+                geometry_address: None,
             },
             WindowRecord {
                 address: 0x2000,
@@ -1691,6 +1796,7 @@ mod tests {
                 tree_depth: 1,
                 z_order: 0,
                 layout: "test".to_owned(),
+                geometry_address: None,
             },
             WindowRecord {
                 address: 0x3000,
@@ -1712,6 +1818,7 @@ mod tests {
                 tree_depth: 0,
                 z_order: 1,
                 layout: "test".to_owned(),
+                geometry_address: None,
             },
         ];
 

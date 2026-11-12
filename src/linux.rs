@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 
+use crate::cancellation::CancellationToken;
 use crate::image::{ExpertWitnessMedia, ImageFormat, MemoryImage};
 use crate::linux_kernel_plugins::LinuxKernelSession;
 use crate::linux_symbols::{
@@ -12,6 +13,8 @@ use crate::linux_symbols::{
 };
 use crate::scan::scan_patterns;
 use crate::symbols::{SymbolStore, default_symbol_store};
+
+mod system_map;
 
 const PAGE_SIZE: u64 = 0x1000;
 const ADDRESS_MASK_4K: u64 = 0x000f_ffff_ffff_f000;
@@ -51,6 +54,8 @@ pub struct LinuxKernelContext {
     /// stable provenance fields above rather than serializing the large table.
     #[serde(skip)]
     pub symbol_table: Option<Arc<LinuxIsf>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_map: Option<crate::linux_system_map::LinuxSystemMapIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +144,8 @@ pub struct LinuxProcessTreeReport {
 pub struct LinuxKernelTextReport {
     pub architecture: String,
     pub banner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_map: Option<crate::linux_system_map::LinuxSystemMapIdentity>,
     pub symbol: String,
     pub virtual_address: u64,
     pub virtual_address_hex: String,
@@ -191,8 +198,8 @@ pub struct LinuxKernelSessionEvidence {
 
 /// A validated kernel-global Linux session and the evidence used to construct it.
 ///
-/// Unlike [`LinuxAnalysisSession`], this value never discovers `init_task` and never traverses
-/// `task_struct.tasks`.
+/// With an ISF input, opening this value does not consult `task_struct.tasks`.
+/// Explicit System.map inputs first require task-session validation and exact ISF completion.
 pub struct OpenedLinuxKernelSession {
     pub session: LinuxKernelSession,
     pub evidence: LinuxKernelSessionEvidence,
@@ -233,11 +240,27 @@ impl LinuxAnalysisSession {
     }
 
     pub fn from_image_with_symbol_store(image: MemoryImage, symbols: &SymbolStore) -> Result<Self> {
+        Self::from_image_with_symbol_store_cancellable(image, symbols, &CancellationToken::new())
+    }
+
+    pub fn from_image_with_symbol_store_cancellable(
+        image: MemoryImage,
+        symbols: &SymbolStore,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        cancellation.check_cancelled()?;
         ensure!(
             is_supported_linux_physical_image(&image),
             "Linux 分析仅支持 LiME、RAW、VMware VMEM 或物理内存 EWF 镜像"
         );
-        let discovery = scan_linux_anchors(&image)?;
+        if let Some(path) = symbols.linux_system_map() {
+            ensure!(
+                symbols.linux_isf().is_none(),
+                "不能同时指定 Linux ISF 和 System.map"
+            );
+            return system_map::open_with_symbols(image, path, symbols, cancellation);
+        }
+        let discovery = scan_linux_anchors_with_policy(&image, true, cancellation)?;
         let banners = discovery
             .banners
             .iter()
@@ -282,6 +305,10 @@ impl LinuxAnalysisSession {
         )?;
         let mut runtime_isf_warning = None;
         if selected.is_none() && symbol_table.is_some() {
+            ensure!(
+                symbols.linux_isf().is_none(),
+                "用户指定的 Linux ISF 未通过 init_task、运行时 linux_banner、页表和活动任务链联合验证；请核对符号与镜像完整性，或重新导入并选择自动判断"
+            );
             runtime_isf_warning = Some(
                 "与镜像完整 linux_banner 匹配的 Volatility 3 ISF 未通过 init_task slide、运行时 linux_banner、页表和活动任务链联合验证；已禁用该 ISF 并尝试安全回退"
                     .to_owned(),
@@ -422,6 +449,7 @@ impl LinuxAnalysisSession {
             task_struct_size: profile.task_size,
             task_struct_offsets: offsets,
             symbol_table,
+            system_map: None,
         };
         Ok(Self {
             image,
@@ -432,6 +460,25 @@ impl LinuxAnalysisSession {
             kernel_text,
             kernel_text_diagnostic,
         })
+    }
+
+    /// Open an address-only System.map session with cancellation at scan chunks
+    /// and runtime-candidate boundaries. No ISF discovery or fallback is performed.
+    pub fn from_image_with_system_map(
+        image: MemoryImage,
+        path: &std::path::Path,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<Self> {
+        cancellation.check_cancelled()?;
+        ensure!(
+            is_supported_linux_physical_image(&image),
+            "System.map 需要可解码的 Linux 物理内存镜像"
+        );
+        system_map::open(
+            image,
+            &crate::linux_system_map::LinuxSystemMap::load(path)?,
+            cancellation,
+        )
     }
 
     pub fn image(&self) -> &MemoryImage {
@@ -456,6 +503,7 @@ impl LinuxAnalysisSession {
         Ok(LinuxKernelTextReport {
             architecture: self.kernel.architecture.clone(),
             banner: self.kernel.banner.clone(),
+            system_map: self.kernel.system_map.clone(),
             symbol: "_stext".to_owned(),
             virtual_address: evidence.virtual_address,
             virtual_address_hex: format!("{:#018x}", evidence.virtual_address),
@@ -590,6 +638,22 @@ impl LinuxAnalysisSession {
         )
     }
 
+    /// 提取进程堆、栈及可选匿名可写映射中的可读字符串。
+    pub fn proc_strings(
+        &self,
+        options: &crate::linux_process::strings::LinuxProcStringsOptions,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<crate::linux_process::strings::LinuxProcStringsReport> {
+        let processes = self.processes(options.process_limit)?;
+        crate::linux_process::strings::analyze_proc_strings(
+            &self.image,
+            &self.kernel,
+            &processes,
+            options,
+            cancellation,
+        )
+    }
+
     pub fn bash(
         &self,
         pid: Option<i32>,
@@ -647,13 +711,49 @@ impl LinuxAnalysisSession {
         file_scan_limit: usize,
         force: bool,
     ) -> Result<crate::linux_pagecache::LinuxDumpFileReport> {
+        self.dump_file_with_force_cancellable(
+            dentry,
+            output,
+            max_size,
+            file_scan_limit,
+            force,
+            &crate::cancellation::CancellationToken::new(),
+        )
+    }
+
+    pub fn dump_file_with_force_cancellable(
+        &self,
+        dentry: u64,
+        output: &std::path::Path,
+        max_size: u64,
+        file_scan_limit: usize,
+        force: bool,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<crate::linux_pagecache::LinuxDumpFileReport> {
+        use crate::output_policy::{OutputPolicy, append_path_suffix};
+        cancellation.check_cancelled()?;
         ensure!(file_scan_limit > 0, "文件扫描结果上限必须大于零");
         ensure!(max_size > 0, "页缓存文件恢复上限必须大于零");
         ensure!(
             is_kernel_pointer(dentry),
             "Linux dentry 必须是规范且按 8 字节对齐的内核虚拟地址"
         );
+        let partial = crate::linux_pagecache::partial_output_path(output)?;
+        let mut policy = OutputPolicy::new(force);
+        for source in self.image.sources() {
+            policy.protect_file("memory_image_or_sidecar", &source.path);
+        }
+        policy.output_file(
+            "recovery_report",
+            append_path_suffix(output, ".recovery.json"),
+        );
+        policy.output_file(
+            "partial_recovery_report",
+            append_path_suffix(&partial, ".recovery.json"),
+        );
+        policy.preflight()?;
         let files = self.files(file_scan_limit)?;
+        cancellation.check_cancelled()?;
         let Some(record) = files.records.iter().find(|record| record.dentry == dentry) else {
             bail!(
                 "Linux filescan 记录中未找到 dentry {dentry:#018x}（stop_reason={:?}，complete={}，structural_complete={}，limit_reached={}，warning_count={}，请求上限={}）；请使用同一镜像的 filescan dentry 地址并检查完整告警",
@@ -665,13 +765,14 @@ impl LinuxAnalysisSession {
                 file_scan_limit
             );
         };
-        let mut report = crate::linux_pagecache::dump_validated_file_with_force(
+        let mut report = crate::linux_pagecache::dump_validated_file_cancellable(
             &self.image,
             &self.kernel,
             record,
             output,
             max_size,
             force,
+            cancellation,
         )?;
         report.filescan_selection = Some(crate::linux_pagecache::LinuxDumpFileSelection {
             requested_limit: file_scan_limit,
@@ -684,6 +785,14 @@ impl LinuxAnalysisSession {
             warning_counts: files.warning_counts.clone(),
             warnings: files.warnings.clone(),
         });
+        let actual = if report.complete {
+            output
+        } else {
+            partial.as_path()
+        };
+        // Once content is published, always finish its provenance sidecar, even if the
+        // caller requests cancellation at this boundary.
+        crate::linux_pagecache::write_recovery_sidecar(&self.image, &mut report, actual, &policy)?;
         Ok(report)
     }
 }
@@ -704,12 +813,70 @@ struct LinuxKernelSessionCandidate {
 /// override is absent, the corresponding DTB or KASLR slide is recovered from matching
 /// VMCOREINFO evidence.  Every candidate is then independently validated by
 /// [`LinuxKernelSession::new`].
+/// System.map inputs are first validated and enriched through a task session; its verified
+/// DTB/slide are reused unless the caller explicitly supplied overrides.
 pub fn open_linux_kernel_session(
     image: MemoryImage,
     symbols: &SymbolStore,
     features: impl IntoIterator<Item = LinuxSymbolFeature>,
     options: LinuxKernelSessionOptions,
 ) -> Result<OpenedLinuxKernelSession> {
+    open_linux_kernel_session_cancellable(
+        image,
+        symbols,
+        features,
+        options,
+        &CancellationToken::new(),
+    )
+}
+
+pub fn open_linux_kernel_session_cancellable(
+    image: MemoryImage,
+    symbols: &SymbolStore,
+    features: impl IntoIterator<Item = LinuxSymbolFeature>,
+    options: LinuxKernelSessionOptions,
+    cancellation: &CancellationToken,
+) -> Result<OpenedLinuxKernelSession> {
+    cancellation.check_cancelled()?;
+    if symbols.linux_system_map().is_some() {
+        let task_session = LinuxAnalysisSession::from_image_with_symbol_store_cancellable(
+            image,
+            symbols,
+            cancellation,
+        )?;
+        let table = task_session.kernel.symbol_table.as_ref().context(
+            "System.map 自动补齐未找到精确匹配的类型来源；请将同一构建的 ISF 放入符号目录，再重试。System.map 本身不能生成结构体类型"
+        )?;
+        let pinned = symbols
+            .without_linux_selection()
+            .with_linux_isf(table.path().to_owned());
+        let options = LinuxKernelSessionOptions {
+            directory_table_base: options
+                .directory_table_base
+                .or(Some(task_session.kernel.directory_table_base)),
+            kernel_slide: options.kernel_slide.or(task_session
+                .kernel_text
+                .as_ref()
+                .and_then(|text| text.kernel_offset)),
+        };
+        let map_warnings = task_session
+            .warnings
+            .iter()
+            .map(|warning| LinuxIsfWarning {
+                kind: warning.kind.clone(),
+                message: warning.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut opened = open_linux_kernel_session_cancellable(
+            task_session.image,
+            &pinned,
+            features,
+            options,
+            cancellation,
+        )?;
+        opened.evidence.symbol_warnings.extend(map_warnings);
+        return Ok(opened);
+    }
     ensure!(
         is_supported_linux_physical_image(&image),
         "Linux kernel-global 分析仅支持已解码的 x86_64 物理内存镜像"
@@ -732,7 +899,7 @@ pub fn open_linux_kernel_session(
         );
     }
 
-    let discovery = scan_linux_kernel_anchors(&image)?;
+    let discovery = scan_linux_anchors_with_policy(&image, false, cancellation)?;
     let banners = discovery
         .banners
         .iter()
@@ -981,7 +1148,71 @@ struct LinuxTaskProfile {
     exit_state: Option<u64>,
     flags: Option<u64>,
     mm: Option<u64>,
-    start_time: Option<u64>,
+    start_time: Option<LinuxTaskStartTime>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LinuxTaskStartTime {
+    Nanoseconds(u64),
+    Timespec { seconds: u64, nanoseconds: u64 },
+}
+
+impl LinuxTaskStartTime {
+    fn from_isf(isf: &LinuxIsf) -> Result<Option<Self>> {
+        if isf
+            .optional_field_offset("task_struct", "start_time")?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if let Ok((offset, 8)) = isf.field_scalar_layout("task_struct", "start_time") {
+            return Ok(Some(Self::Nanoseconds(offset)));
+        }
+        let (seconds, seconds_width) =
+            isf.field_scalar_layout("task_struct", "start_time.tv_sec")?;
+        let (nanoseconds, nanoseconds_width) =
+            isf.field_scalar_layout("task_struct", "start_time.tv_nsec")?;
+        ensure!(
+            seconds_width == 8 && nanoseconds_width == 8 && seconds != nanoseconds,
+            "task_struct.start_time 的 timespec 字段布局无效"
+        );
+        Ok(Some(Self::Timespec {
+            seconds,
+            nanoseconds,
+        }))
+    }
+
+    fn offset(self) -> u64 {
+        match self {
+            Self::Nanoseconds(offset) => offset,
+            Self::Timespec { seconds, .. } => seconds,
+        }
+    }
+
+    fn read(self, space: &LinuxX64AddressSpace<'_>, task: u64) -> Result<u64> {
+        match self {
+            Self::Nanoseconds(offset) => space.read_u64(task + offset),
+            Self::Timespec {
+                seconds,
+                nanoseconds,
+            } => {
+                let seconds = space.read_u64(task + seconds)?;
+                let nanoseconds = space.read_u64(task + nanoseconds)?;
+                timespec_start_time_ns(seconds, nanoseconds)
+            }
+        }
+    }
+}
+
+fn timespec_start_time_ns(seconds: u64, nanoseconds: u64) -> Result<u64> {
+    ensure!(
+        nanoseconds < 1_000_000_000,
+        "task_struct.start_time.tv_nsec 超出有效范围"
+    );
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .context("task_struct.start_time 为负数或超出纳秒范围")
 }
 
 impl LinuxTaskProfile {
@@ -1022,6 +1253,19 @@ impl LinuxTaskProfile {
             self.state + self.state_size as u64 <= self.task_size,
             "task_struct state 超出结构范围"
         );
+        if let Some(start_time) = self.start_time {
+            let last = match start_time {
+                LinuxTaskStartTime::Nanoseconds(offset) => offset,
+                LinuxTaskStartTime::Timespec {
+                    seconds,
+                    nanoseconds,
+                } => seconds.max(nanoseconds),
+            };
+            ensure!(
+                last.checked_add(8).is_some_and(|end| end <= self.task_size),
+                "task_struct.start_time 超出结构范围"
+            );
+        }
         Ok(())
     }
 
@@ -1039,11 +1283,17 @@ impl LinuxTaskProfile {
             ("exit_state", self.exit_state),
             ("flags", self.flags),
             ("mm", self.mm),
-            ("start_time", self.start_time),
+            (
+                "start_time",
+                self.start_time.map(LinuxTaskStartTime::offset),
+            ),
         ] {
             if let Some(value) = value {
                 fields.push((name, value));
             }
+        }
+        if let Some(LinuxTaskStartTime::Timespec { nanoseconds, .. }) = self.start_time {
+            fields.push(("start_time.tv_nsec", nanoseconds));
         }
         fields
     }
@@ -1085,16 +1335,13 @@ struct VmcoreInfoEvidence {
 type LinuxRuntimeSelection = (InitTaskCandidate, u64, String, Option<u64>);
 
 fn scan_linux_anchors(image: &MemoryImage) -> Result<LinuxDiscovery> {
-    scan_linux_anchors_with_policy(image, true)
-}
-
-fn scan_linux_kernel_anchors(image: &MemoryImage) -> Result<LinuxDiscovery> {
-    scan_linux_anchors_with_policy(image, false)
+    scan_linux_anchors_with_policy(image, true, &CancellationToken::new())
 }
 
 fn scan_linux_anchors_with_policy(
     image: &MemoryImage,
     require_task_anchor: bool,
+    cancellation: &CancellationToken,
 ) -> Result<LinuxDiscovery> {
     let patterns = [
         LINUX_BANNER_PATTERN,
@@ -1102,17 +1349,19 @@ fn scan_linux_anchors_with_policy(
         SWAPPER_PATTERN,
         VMCOREINFO_PATTERN,
     ];
-    let report = scan_patterns(
+    let report = crate::scan::scan_patterns_cancellable(
         image,
         &patterns,
         DISCOVERY_LIMIT_PER_PATTERN,
         DISCOVERY_CHUNK_SIZE,
+        cancellation,
     )?;
     let mut banners = Vec::new();
     let mut btf_hits = Vec::new();
     let mut swapper_hits = Vec::new();
     let mut vmcoreinfo = Vec::new();
     for hit in report.hits {
+        cancellation.check_cancelled()?;
         match hit.pattern_index {
             0 => {
                 if let Some(text) = read_physical_c_string(image, hit.physical_address, 512) {
@@ -1352,15 +1601,23 @@ fn profile_from_validated_memory_heuristics(
             swapper_candidates
         );
     };
-    let task_size = align_up(layout.comm.saturating_add(64), 0x100)
-        .context("无符号 task_struct 大小推断溢出")?;
     let page_table_evidence = vmcoreinfo_physical
         .map(|address| format!("vmcoreinfo={address:#x}"))
         .unwrap_or_else(|| "page_table=validated_pml4_scan".to_owned());
+    let profile = task_profile_from_inferred_layout(&layout, &page_table_evidence)?;
+    Ok(Some((profile, banner)))
+}
+
+fn task_profile_from_inferred_layout(
+    layout: &HeuristicTaskLayout,
+    page_table_evidence: &str,
+) -> Result<LinuxTaskProfile> {
+    let task_size = align_up(layout.comm.saturating_add(64), 0x100)
+        .context("无符号 task_struct 大小推断溢出")?;
     let profile = LinuxTaskProfile {
         source: "validated_memory_heuristic",
         fingerprint: format!(
-            "symbol-less runtime inference; {page_table_evidence}; init_task={:#x}/{:#x}; tasks={:#x}; pid={:#x}; tgid={:#x}; real_parent={:#x}; comm={:#x}; state={:#x}/{}; validated_task_ring={}",
+            "runtime field inference; {page_table_evidence}; init_task={:#x}/{:#x}; tasks={:#x}; pid={:#x}; tgid={:#x}; real_parent={:#x}; comm={:#x}; state={:#x}/{}; observed_tasks={}",
             layout.task_virtual,
             layout.task_physical,
             layout.tasks,
@@ -1389,7 +1646,7 @@ fn profile_from_validated_memory_heuristics(
         start_time: None,
     };
     profile.validate()?;
-    Ok(Some((profile, banner)))
+    Ok(profile)
 }
 
 fn infer_task_layout_at_swapper(
@@ -1936,7 +2193,7 @@ fn profile_from_volatility_isf(isf: &LinuxIsf) -> Result<LinuxTaskProfile> {
         exit_state: isf.optional_field_offset("task_struct", "exit_state")?,
         flags: isf.optional_field_offset("task_struct", "flags")?,
         mm: isf.optional_field_offset("task_struct", "mm")?,
-        start_time: isf.optional_field_offset("task_struct", "start_time")?,
+        start_time: LinuxTaskStartTime::from_isf(isf)?,
     };
     profile.validate()?;
     Ok(profile)
@@ -2379,7 +2636,7 @@ fn exact_banner_profile(banner: &str) -> Option<LinuxTaskProfile> {
             tgid: 0x8c4,
             real_parent: 0x8d0,
             parent: Some(0x8d8),
-            start_time: Some(0x9e8),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0x9e8)),
             comm: 0xa78,
             comm_len: 16,
             exit_state: None,
@@ -2398,7 +2655,7 @@ fn exact_banner_profile(banner: &str) -> Option<LinuxTaskProfile> {
             tgid: 0x904,
             real_parent: 0x910,
             parent: Some(0x918),
-            start_time: Some(0xa28),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0xa28)),
             comm: 0xaa8,
             comm_len: 16,
             exit_state: None,
@@ -2417,7 +2674,7 @@ fn exact_banner_profile(banner: &str) -> Option<LinuxTaskProfile> {
             tgid: 0x9a4,
             real_parent: 0x9b0,
             parent: Some(0x9b8),
-            start_time: Some(0xaf8),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0xaf8)),
             comm: 0xbc0,
             comm_len: 16,
             exit_state: None,
@@ -2436,7 +2693,7 @@ fn exact_banner_profile(banner: &str) -> Option<LinuxTaskProfile> {
             tgid: 0x4ac,
             real_parent: 0x4b8,
             parent: Some(0x4c0),
-            start_time: Some(0x5e0),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0x5e0)),
             comm: 0x660,
             comm_len: 16,
             exit_state: Some(0x444),
@@ -2672,7 +2929,7 @@ fn task_profile_from_btf_blob(
         exit_state: optional("exit_state"),
         flags: optional("flags"),
         mm: optional("mm"),
-        start_time: optional("start_time"),
+        start_time: optional("start_time").map(LinuxTaskStartTime::Nanoseconds),
     };
     profile.validate()?;
     Ok(profile)
@@ -3471,7 +3728,7 @@ fn read_process_record(
         .or_else(|| raw_mm.filter(|address| *address != 0).map(|_| false));
     let start_time_ns = profile
         .start_time
-        .map(|offset| space.read_u64(task + offset))
+        .map(|layout| layout.read(space, task))
         .transpose()?;
     Ok(LinuxProcessRecord {
         task,
@@ -3480,7 +3737,7 @@ fn read_process_record(
         tgid,
         ppid,
         name,
-        state: linux_task_state(state_raw, exit_state),
+        state: task_state_for_profile(profile, state_raw, exit_state),
         state_raw,
         exit_state,
         flags,
@@ -3488,6 +3745,30 @@ fn read_process_record(
         kernel_thread,
         start_time_ns,
     })
+}
+
+fn task_state_for_profile(
+    profile: &LinuxTaskProfile,
+    state: u64,
+    exit_state: Option<u32>,
+) -> String {
+    // System.map has no state constants; pre-u64 start_time kernels also predate
+    // the modern state/exit-state masks. Preserve raw values instead of calling
+    // old TASK_WAKEKILL (0x80) "dead" or reversing EXIT_ZOMBIE/EXIT_DEAD.
+    if profile.source == "system_map_validated_memory"
+        || matches!(
+            profile.start_time,
+            Some(LinuxTaskStartTime::Timespec { .. })
+        )
+    {
+        if let Some(exit) = exit_state.filter(|value| *value != 0) {
+            return format!("unknown(state={state:#x},exit_state={exit:#x})");
+        }
+        if state & !0xf != 0 {
+            return format!("unknown({state:#x})");
+        }
+    }
+    linux_task_state(state, exit_state)
 }
 
 fn linux_task_state(state: u64, exit_state: Option<u32>) -> String {
@@ -3539,6 +3820,81 @@ mod tests {
 
     use super::*;
     use crate::linux_kernel_plugins::LinuxKernelMemory;
+
+    #[test]
+    fn isf_task_start_time_reads_legacy_timespec_and_scalar_nanoseconds() {
+        let mut types = serde_json::json!({
+            "task_struct": {"size": 512, "fields": {
+                "start_time": {"offset": 256, "type": {"kind": "struct", "name": "timespec"}}
+            }},
+            "timespec": {"size": 16, "fields": {
+                "tv_sec": {"offset": 0, "type": {"kind": "base", "name": "long unsigned int"}},
+                "tv_nsec": {"offset": 8, "type": {"kind": "base", "name": "long unsigned int"}}
+            }}
+        });
+        let isf = crate::linux_symbols::test_isf(types.clone());
+        let legacy = LinuxTaskStartTime::from_isf(&isf).unwrap().unwrap();
+        assert!(matches!(
+            legacy,
+            LinuxTaskStartTime::Timespec {
+                seconds: 256,
+                nanoseconds: 264
+            }
+        ));
+
+        let path = temporary_path("timespec-start-time");
+        let task = 0xffff_8000_0020_0000u64;
+        let mut bytes = vec![0; 0x20_2000];
+        put_u64(
+            &mut bytes,
+            0x1000 + ((task >> 39) & 0x1ff) as usize * 8,
+            0x2003,
+        );
+        put_u64(&mut bytes, 0x2000, 0x3003);
+        put_u64(&mut bytes, 0x3008, 0x20_0083);
+        put_u64(&mut bytes, 0x20_0100, 42);
+        put_u64(&mut bytes, 0x20_0108, 123_456_789);
+        fs::write(&path, bytes).unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let space = LinuxX64AddressSpace::new(&image, 0x1000).unwrap();
+        assert_eq!(legacy.read(&space, task).unwrap(), 42_123_456_789);
+        types["task_struct"]["fields"]["start_time"]["type"] =
+            serde_json::json!({"kind": "base", "name": "long unsigned int"});
+        let scalar = LinuxTaskStartTime::from_isf(&crate::linux_symbols::test_isf(types.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(scalar.read(&space, task).unwrap(), 42);
+        drop(image);
+        fs::remove_file(path).unwrap();
+        assert!(timespec_start_time_ns(1, 1_000_000_000).is_err());
+        assert!(timespec_start_time_ns(u64::MAX, 0).is_err());
+        types["task_struct"]["fields"]["start_time"]["type"] = serde_json::json!({"kind": "pointer", "subtype": {"kind": "struct", "name": "timespec"}});
+        assert!(LinuxTaskStartTime::from_isf(&crate::linux_symbols::test_isf(types)).is_err());
+    }
+
+    #[test]
+    fn legacy_timespec_profiles_do_not_apply_modern_task_state_masks() {
+        let mut profile = synthetic_profile();
+        profile.start_time = Some(LinuxTaskStartTime::Timespec {
+            seconds: 0x58,
+            nanoseconds: 0x60,
+        });
+        assert_eq!(task_state_for_profile(&profile, 2, None), "uninterruptible");
+        assert_eq!(
+            task_state_for_profile(&profile, 0x82, Some(0)),
+            "unknown(0x82)"
+        );
+        assert_eq!(
+            task_state_for_profile(&profile, 0, Some(0x10)),
+            "unknown(state=0x0,exit_state=0x10)"
+        );
+        assert_eq!(
+            task_state_for_profile(&profile, 0xffff_8000_0000_0001, None),
+            "unknown(0xffff800000000001)"
+        );
+        profile.start_time = Some(LinuxTaskStartTime::Nanoseconds(0x58));
+        assert_eq!(task_state_for_profile(&profile, 0, Some(0x20)), "zombie");
+    }
 
     #[test]
     fn exact_profiles_require_the_full_build_banner() {
@@ -3892,6 +4248,7 @@ mod tests {
             task_struct_size: profile.task_size,
             task_struct_offsets: BTreeMap::new(),
             symbol_table: None,
+            system_map: None,
         };
         let scan = DiscoveryScanStats {
             bytes_scanned: 0,
@@ -3944,7 +4301,7 @@ mod tests {
             tgid: 0x304,
             real_parent: 0x310,
             parent: Some(0x318),
-            start_time: Some(0x400),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0x400)),
             comm: 0x500,
             comm_len: 16,
             exit_state: None,
@@ -4108,7 +4465,7 @@ mod tests {
             tgid: 0x44,
             real_parent: 0x48,
             parent: Some(0x50),
-            start_time: Some(0x58),
+            start_time: Some(LinuxTaskStartTime::Nanoseconds(0x58)),
             comm: 0x70,
             comm_len: 16,
             exit_state: None,
@@ -4142,7 +4499,7 @@ mod tests {
         put_u64(bytes, physical + profile.parent.unwrap() as usize, parent);
         put_u64(
             bytes,
-            physical + profile.start_time.unwrap() as usize,
+            physical + profile.start_time.unwrap().offset() as usize,
             pid as u64 * 1000,
         );
         let name_bytes = name.as_bytes();
@@ -4331,6 +4688,7 @@ mod tests {
                 task_struct_size: 0x1000,
                 task_struct_offsets: BTreeMap::new(),
                 symbol_table: None,
+                system_map: None,
             },
             processes,
             complete: true,

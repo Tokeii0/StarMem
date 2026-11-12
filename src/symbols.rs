@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::address::{WindowsAddressSpace, X64AddressSpace};
+use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::output_policy::{OutputPolicy, OutputTarget};
-use crate::scan::scan_exact;
+use crate::scan::scan_patterns_cancellable;
 
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const CODEVIEW_CACHE_SCHEMA: u32 = 1;
@@ -70,6 +71,8 @@ struct CachedKernelCodeView {
 pub struct SymbolStore {
     search_roots: Vec<PathBuf>,
     writable_root: PathBuf,
+    linux_isf: Option<PathBuf>,
+    linux_system_map: Option<PathBuf>,
 }
 
 impl SymbolStore {
@@ -77,6 +80,8 @@ impl SymbolStore {
         Self {
             search_roots: Vec::new(),
             writable_root,
+            linux_isf: None,
+            linux_system_map: None,
         }
     }
 
@@ -105,6 +110,35 @@ impl SymbolStore {
 
     pub fn writable_root(&self) -> &Path {
         &self.writable_root
+    }
+
+    /// Pin Linux analysis to one user-supplied ISF, without changing Windows PDB resolution.
+    pub fn with_linux_isf(mut self, path: PathBuf) -> Self {
+        self.linux_isf = Some(path);
+        self
+    }
+
+    pub fn linux_isf(&self) -> Option<&Path> {
+        self.linux_isf.as_deref()
+    }
+
+    /// Pin Linux addresses. Type completion must verify this map against an exact ISF.
+    pub fn with_linux_system_map(mut self, path: PathBuf) -> Self {
+        self.linux_system_map = Some(path);
+        self
+    }
+
+    pub fn linux_system_map(&self) -> Option<&Path> {
+        self.linux_system_map.as_deref()
+    }
+
+    /// Search the configured roots without the explicit Linux input. Callers must
+    /// validate any candidate against that input before using it.
+    pub fn without_linux_selection(&self) -> Self {
+        let mut store = self.clone();
+        store.linux_isf = None;
+        store.linux_system_map = None;
+        store
     }
 
     /// Locate an already cached PDB without mutating any symbol store.
@@ -144,15 +178,33 @@ impl SymbolStore {
 }
 
 pub fn discover_codeview(image: &MemoryImage, pdb_name: &str) -> Result<Vec<CodeViewRecord>> {
+    discover_codeviews(image, &[pdb_name], &CancellationToken::new())
+}
+
+fn discover_codeviews(
+    image: &MemoryImage,
+    pdb_names: &[&str],
+    cancellation: &CancellationToken,
+) -> Result<Vec<CodeViewRecord>> {
+    cancellation.check_cancelled()?;
     if let Ok(Some(record)) = discover_kernel_codeview(image)
-        && record.pdb_name.eq_ignore_ascii_case(pdb_name)
+        && pdb_names
+            .iter()
+            .any(|name| record.pdb_name.eq_ignore_ascii_case(name))
     {
         return Ok(vec![record]);
     }
 
-    let report = scan_exact(image, pdb_name.as_bytes(), 128, DEFAULT_CHUNK_SIZE)?;
+    let patterns = pdb_names
+        .iter()
+        .map(|name| name.as_bytes())
+        .collect::<Vec<_>>();
+    let report =
+        scan_patterns_cancellable(image, &patterns, 128, DEFAULT_CHUNK_SIZE, cancellation)?;
     let mut records = Vec::new();
     for hit in report.hits {
+        cancellation.check_cancelled()?;
+        let pdb_name = pdb_names[hit.pattern_index];
         let Some(span) = image
             .spans()
             .iter()
@@ -214,7 +266,15 @@ pub fn discover_codeview(image: &MemoryImage, pdb_name: &str) -> Result<Vec<Code
             break;
         }
     }
-    records.sort_by_key(|record| record.physical_address);
+    // Keep the historical kernel-name preference, then the first physical copy.
+    records.sort_by_key(|record| {
+        (
+            pdb_names
+                .iter()
+                .position(|name| record.pdb_name.eq_ignore_ascii_case(name)),
+            record.physical_address,
+        )
+    });
     let mut identities = HashSet::new();
     records.retain(|record| {
         identities.insert((
@@ -550,15 +610,17 @@ pub fn resolve_kernel_pdb_with_store(
     image: &MemoryImage,
     store: &SymbolStore,
 ) -> Result<ResolvedPdb> {
-    const KERNEL_PDB_NAMES: &[&str] = &[
-        "ntkrnlmp.pdb",
-        "ntkrnlpa.pdb",
-        "ntoskrnl.pdb",
-        "ntkrpamp.pdb",
-    ];
-    let cached = KERNEL_PDB_NAMES
-        .iter()
-        .find_map(|name| load_cached_kernel_codeview(image, store, name));
+    resolve_kernel_pdb_with_store_policy(image, store, true)
+}
+
+/// Resolve the same exact kernel identity while honoring the host's offline policy.
+/// Offline operation still validates a local PDB against the image's CodeView record.
+pub fn resolve_kernel_pdb_with_store_policy(
+    image: &MemoryImage,
+    store: &SymbolStore,
+    allow_download: bool,
+) -> Result<ResolvedPdb> {
+    let cached = cached_kernel_codeview(image, store);
     let discovered = cached.is_none();
     let record = match cached {
         Some(record) => record,
@@ -573,15 +635,67 @@ pub fn resolve_kernel_pdb_with_store(
             select_unique_record(&matches)?.clone()
         }
     };
-    let protected = image
-        .sources()
-        .map(|source| ("memory_image_or_sidecar", source.path.as_path()))
-        .collect::<Vec<_>>();
-    let path = store.resolve_protecting(&record, &protected)?;
+    let path = resolve_kernel_record(image, store, &record, allow_download)?;
     if discovered {
         persist_kernel_codeview_cache(image, store, &record);
     }
     Ok(ResolvedPdb { record, path })
+}
+
+const KERNEL_PDB_NAMES: &[&str] = &[
+    "ntkrnlmp.pdb",
+    "ntkrnlpa.pdb",
+    "ntoskrnl.pdb",
+    "ntkrpamp.pdb",
+];
+
+/// Revalidated per-image cache of the kernel identity confirmed by an earlier bootstrap.
+pub fn cached_kernel_codeview(image: &MemoryImage, store: &SymbolStore) -> Option<CodeViewRecord> {
+    KERNEL_PDB_NAMES
+        .iter()
+        .find_map(|name| load_cached_kernel_codeview(image, store, name))
+}
+
+/// Every distinct kernel CodeView identity found in physical memory, across all kernel PDB
+/// names. Physical RSDS hits may come from cached kernel files of other builds or
+/// architectures, so callers must confirm a candidate against the running kernel.
+pub fn discover_kernel_codeviews(image: &MemoryImage) -> Result<Vec<CodeViewRecord>> {
+    discover_kernel_codeviews_cancellable(image, &CancellationToken::new())
+}
+
+pub fn discover_kernel_codeviews_cancellable(
+    image: &MemoryImage,
+    cancellation: &CancellationToken,
+) -> Result<Vec<CodeViewRecord>> {
+    // One physical pass retains every kernel identity for the bootstrap verifier.
+    discover_codeviews(image, KERNEL_PDB_NAMES, cancellation)
+}
+
+pub fn resolve_kernel_record(
+    image: &MemoryImage,
+    store: &SymbolStore,
+    record: &CodeViewRecord,
+    allow_download: bool,
+) -> Result<PathBuf> {
+    if allow_download {
+        let protected = image
+            .sources()
+            .map(|source| ("memory_image_or_sidecar", source.path.as_path()))
+            .collect::<Vec<_>>();
+        store.resolve_protecting(record, &protected)
+    } else {
+        store.find(record)?.with_context(|| {
+            format!(
+                "离线模式缺少匹配的本地 PDB：{} / {}",
+                record.pdb_name, record.symbol_key
+            )
+        })
+    }
+}
+
+/// Publish a kernel identity only after it bootstrapped the running kernel.
+pub fn remember_kernel_codeview(image: &MemoryImage, store: &SymbolStore, record: &CodeViewRecord) {
+    persist_kernel_codeview_cache(image, store, record);
 }
 
 fn load_cached_kernel_codeview(
@@ -589,6 +703,9 @@ fn load_cached_kernel_codeview(
     store: &SymbolStore,
     pdb_name: &str,
 ) -> Option<CodeViewRecord> {
+    if image.is_live() {
+        return None;
+    }
     let (cache_path, source_file_len, modified_unix_nanos) =
         kernel_codeview_cache_locator(image, store)?;
     let bytes = fs::read(cache_path).ok()?;
@@ -610,6 +727,9 @@ fn persist_kernel_codeview_cache(
     store: &SymbolStore,
     record: &CodeViewRecord,
 ) {
+    if image.is_live() {
+        return;
+    }
     let Some((cache_path, source_file_len, modified_unix_nanos)) =
         kernel_codeview_cache_locator(image, store)
     else {
@@ -877,6 +997,101 @@ mod tests {
             symbol_key: "123456789ABCDEF001020304050607081".to_owned(),
             physical_address: 0,
         }
+    }
+
+    #[test]
+    fn offline_kernel_resolution_reports_exact_missing_pdb_without_downloading() {
+        let directory = std::env::temp_dir().join(format!(
+            "starmem-offline-pdb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("test directory");
+        let image_path = directory.join("kernel.raw");
+        let mut bytes = vec![0u8; 8192];
+        let offset = 0x400;
+        bytes[offset..offset + 4].copy_from_slice(b"RSDS");
+        bytes[offset + 4..offset + 20].copy_from_slice(&[
+            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 1, 2, 3, 4, 5, 6, 7, 8,
+        ]);
+        bytes[offset + 20..offset + 24].copy_from_slice(&10u32.to_le_bytes());
+        bytes[offset + 24..offset + 36].copy_from_slice(b"ntkrnlmp.pdb");
+        fs::write(&image_path, bytes).expect("fixture");
+        let image = MemoryImage::open(&image_path).expect("memory image");
+        let cache = directory.join("symbols");
+        let error =
+            resolve_kernel_pdb_with_store_policy(&image, &SymbolStore::new(cache.clone()), false)
+                .expect_err("offline missing PDB must fail");
+        let message = format!("{error:#}");
+        drop(image);
+        fs::remove_file(&image_path).expect("remove fixture");
+        assert!(message.contains("离线模式缺少匹配的本地 PDB"), "{message}");
+        assert!(
+            message.contains("123456789ABCDEF00102030405060708A"),
+            "{message}"
+        );
+        assert!(
+            !cache.exists(),
+            "offline lookup must not download or publish a PDB"
+        );
+        fs::remove_dir(directory).expect("remove empty fixture directory");
+    }
+
+    #[test]
+    fn kernel_candidates_keep_identities_from_every_kernel_pdb_name() {
+        // A cached x64 ntoskrnl.pdb file must not hide the running x86 ntkrpamp.pdb kernel.
+        let directory = std::env::temp_dir().join(format!(
+            "starmem-kernel-candidates-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("test directory");
+        let image_path = directory.join("kernel.raw");
+        let mut bytes = vec![0u8; 0x3000];
+        for (offset, name, age) in [
+            (0x400, &b"ntoskrnl.pdb"[..], 1u32),
+            (0x2400, &b"ntkrpamp.pdb"[..], 2),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(b"RSDS");
+            bytes[offset + 4..offset + 20].copy_from_slice(&[age as u8; 16]);
+            bytes[offset + 20..offset + 24].copy_from_slice(&age.to_le_bytes());
+            bytes[offset + 24..offset + 24 + name.len()].copy_from_slice(name);
+        }
+        fs::write(&image_path, bytes).expect("fixture");
+        let image = MemoryImage::open(&image_path).expect("memory image");
+        let names = discover_kernel_codeviews(&image)
+            .expect("candidate discovery")
+            .into_iter()
+            .map(|record| (record.pdb_name, record.age, record.physical_address))
+            .collect::<Vec<_>>();
+        drop(image);
+        fs::remove_file(&image_path).expect("remove fixture");
+        fs::remove_dir(&directory).expect("remove fixture directory");
+        assert_eq!(
+            names,
+            [
+                ("ntoskrnl.pdb".to_owned(), 1, 0x400),
+                ("ntkrpamp.pdb".to_owned(), 2, 0x2400)
+            ]
+        );
+    }
+
+    #[test]
+    fn kernel_candidate_scan_respects_cancellation_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cancel.raw");
+        fs::write(&path, vec![0u8; 4096]).unwrap();
+        let image = MemoryImage::open(&path).unwrap();
+        let handle = crate::cancellation::CancellationHandle::new();
+        handle.cancel();
+        let error = discover_kernel_codeviews_cancellable(&image, &handle.token()).unwrap_err();
+        assert!(crate::cancellation::is_cancellation_error(&error));
     }
 
     #[test]

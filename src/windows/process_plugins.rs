@@ -722,13 +722,24 @@ pub fn environment_variables(
             .sum::<usize>()
             > limit;
     let mut warnings = process_warnings(processes.warnings);
+    let unreadable_environments = processes
+        .processes
+        .iter()
+        .filter(|process| {
+            process.details.environment_address.is_some()
+                && process.details.environment_variable_count.is_none()
+        })
+        .count();
+    if unreadable_environments > 0 {
+        warnings.push(format!("{unreadable_environments} 个进程的环境块未能完整读取；缺页或未找到有界终止符不等于没有环境变量"));
+    }
     if truncated {
         warnings.push(format!("环境变量结果达到 {limit} 条上限"));
     }
     Ok(EnvironmentReport {
         records,
         process_count,
-        complete: processes.complete && !truncated,
+        complete: processes.complete && !truncated && unreadable_environments == 0,
         warnings,
     })
 }

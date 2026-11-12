@@ -1,7 +1,50 @@
 use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
+use crate::cancellation::CancellationToken;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
+
+/// Opt-in, shared limits for decoders consuming untrusted recovered Hive bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryReadGuard {
+    cancel: CancellationToken,
+    cells: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    max_cells: u64,
+    max_bytes: u64,
+}
+
+impl RegistryReadGuard {
+    pub(crate) fn new(cancel: &CancellationToken, max_cells: u64, max_bytes: u64) -> Self {
+        Self {
+            cancel: cancel.clone(),
+            cells: Arc::new(AtomicU64::new(0)),
+            bytes: Arc::new(AtomicU64::new(0)),
+            max_cells,
+            max_bytes,
+        }
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.cancel.check_cancelled()?;
+        ensure!(
+            self.cells.load(Ordering::Relaxed) <= self.max_cells
+                && self.bytes.load(Ordering::Relaxed) <= self.max_bytes,
+            "STARMEM_REGISTRY_BUDGET: 注册表解析达到单元访问或累计字节预算"
+        );
+        Ok(())
+    }
+    fn charge(&self, cells: u64, bytes: usize) -> Result<()> {
+        self.check()?;
+        self.cells.fetch_add(cells, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.check()
+    }
+}
 
 const HIVE_BIN_BASE: usize = 0x1000;
 const INVALID_CELL: u32 = u32::MAX;
@@ -14,6 +57,8 @@ const MAX_ITEMS: usize = 1_000_000;
 pub struct RegistryHive {
     bytes: Vec<u8>,
     root_cell: u32,
+    recovered_ranges: Option<Vec<Range<usize>>>,
+    read_guard: Option<RegistryReadGuard>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,14 +136,73 @@ impl RegistryHive {
         );
         let root_cell = read_u32_at(&bytes, 0x24)?;
         ensure!(root_cell != INVALID_CELL, "registry hive has no root cell");
-        let hive = Self { bytes, root_cell };
+        let hive = Self {
+            bytes,
+            root_cell,
+            recovered_ranges: None,
+            read_guard: None,
+        };
         hive.key_node(root_cell)
             .context("registry hive root cell is invalid")?;
         Ok(hive)
     }
 
+    /// Parse a memory reconstruction without treating zero-filled holes as
+    /// evidence. The regf header may be synthesized, but every consumed cell
+    /// must be covered by the acquisition's actual recovered ranges.
+    pub(crate) fn from_recovered_bytes(
+        bytes: Vec<u8>,
+        mut ranges: Vec<Range<usize>>,
+    ) -> Result<Self> {
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::new();
+        for range in ranges {
+            ensure!(
+                range.start <= range.end && range.end <= bytes.len(),
+                "invalid recovered hive range"
+            );
+            if range.is_empty() {
+                continue;
+            }
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        let mut hive = Self::from_bytes(bytes)?;
+        hive.recovered_ranges = Some(merged);
+        hive.key_node(hive.root_cell)
+            .context("registry root cell is not fully recovered")?;
+        Ok(hive)
+    }
+
+    fn ensure_recovered(&self, start: usize, end: usize, cell_index: u32) -> Result<()> {
+        if let Some(ranges) = &self.recovered_ranges {
+            let index = ranges.partition_point(|range| range.start <= start);
+            ensure!(
+                index > 0 && ranges[index - 1].end >= end,
+                "registry cell {cell_index:#x} intersects unrecovered hive bytes ({start:#x}..{end:#x})"
+            );
+        }
+        Ok(())
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn set_read_guard(&mut self, guard: RegistryReadGuard) {
+        self.read_guard = Some(guard);
+    }
+
+    fn check_read_guard(&self) -> Result<()> {
+        if let Some(guard) = &self.read_guard {
+            guard.check()?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> Result<RegistryKey> {
@@ -195,6 +299,7 @@ impl RegistryHive {
         indices.truncate(node.subkey_count.min(MAX_ITEMS as u32) as usize);
         let mut keys = Vec::with_capacity(indices.len());
         for index in indices {
+            self.check_read_guard()?;
             match self.key_node(index) {
                 Ok(node) => keys.push(node.key),
                 Err(error) => warnings.push(format!(
@@ -262,6 +367,7 @@ impl RegistryHive {
         }
         let mut values = Vec::with_capacity(listed_count);
         for index in 0..listed_count {
+            self.check_read_guard()?;
             let cell_index = read_u32_at(list, index * 4)?;
             match self.value(cell_index) {
                 Ok(value) => values.push(value),
@@ -327,6 +433,9 @@ impl RegistryHive {
     }
 
     fn cell(&self, cell_index: u32) -> Result<&[u8]> {
+        if let Some(guard) = &self.read_guard {
+            guard.charge(1, 0)?;
+        }
         ensure!(
             cell_index & 0x8000_0000 == 0,
             "volatile registry cell {cell_index:#x} is not part of the stable hive"
@@ -334,6 +443,7 @@ impl RegistryHive {
         let offset = HIVE_BIN_BASE
             .checked_add(usize::try_from(cell_index)?)
             .context("registry cell offset overflow")?;
+        self.ensure_recovered(offset, offset + 4, cell_index)?;
         let raw_size = read_i32_at(&self.bytes, offset)?;
         ensure!(
             raw_size < 0,
@@ -345,6 +455,10 @@ impl RegistryHive {
             .checked_add(size)
             .context("registry cell range overflow")?;
         ensure!(end <= self.bytes.len(), "registry cell exceeds hive image");
+        self.ensure_recovered(offset, end, cell_index)?;
+        if let Some(guard) = &self.read_guard {
+            guard.charge(0, size)?;
+        }
         Ok(&self.bytes[offset + 4..end])
     }
 
@@ -408,6 +522,7 @@ impl RegistryHive {
             }
             b"ri" => {
                 for index in 0..count.min(cell.len().saturating_sub(4) / 4) {
+                    self.check_read_guard()?;
                     let nested = read_u32_at(cell, 4 + index * 4)?;
                     if let Err(error) =
                         self.collect_subkey_indices(nested, depth + 1, visited, output, warnings)
@@ -453,6 +568,9 @@ impl RegistryHive {
 
     fn value_data(&self, data_length_raw: u32, data_offset: u32) -> Result<Vec<u8>> {
         let length = usize::try_from(data_length_raw & 0x7fff_ffff)?;
+        if let Some(guard) = &self.read_guard {
+            guard.charge(0, length)?;
+        }
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -810,6 +928,50 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("subkey list is absent"))
         );
+    }
+
+    #[test]
+    fn sparse_hive_does_not_treat_zero_filled_value_pages_as_recovered_data() {
+        let mut bytes = vec![0u8; 0x5000];
+        bytes[..4].copy_from_slice(b"regf");
+        bytes[0x1000..0x1004].copy_from_slice(b"hbin");
+        let mut next = 0x20u32;
+        let data = push_cell(&mut bytes, &mut next, &vec![0u8; 0x2000]);
+        let mut value = vec![0u8; 0x15];
+        value[..2].copy_from_slice(b"vk");
+        value[2..4].copy_from_slice(&1u16.to_le_bytes());
+        value[4..8].copy_from_slice(&0x2000u32.to_le_bytes());
+        value[8..12].copy_from_slice(&data.to_le_bytes());
+        value[12..16].copy_from_slice(&3u32.to_le_bytes());
+        value[16..18].copy_from_slice(&VALUE_COMP_NAME.to_le_bytes());
+        value[0x14] = b'V';
+        let vk = push_cell(&mut bytes, &mut next, &value);
+        let list = push_cell(&mut bytes, &mut next, &vk.to_le_bytes());
+        let root = push_cell(
+            &mut bytes,
+            &mut next,
+            &key_payload("ROOT", 0, INVALID_CELL, 1, list),
+        );
+        bytes[0x24..0x28].copy_from_slice(&root.to_le_bytes());
+        let whole = RegistryHive::from_bytes(bytes.clone()).unwrap();
+        assert!(whole.query_value("", "V").unwrap().is_some());
+
+        let sparse =
+            RegistryHive::from_recovered_bytes(bytes.clone(), vec![0x3000..0x5000, 0x1000..0x2000])
+                .unwrap();
+        let values = sparse.values_best_effort(&sparse.root().unwrap()).unwrap();
+        assert!(values.values.is_empty());
+        assert!(
+            values
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unrecovered hive bytes"))
+        );
+
+        let adjacent =
+            RegistryHive::from_recovered_bytes(bytes, vec![0x2000..0x5000, 0x1000..0x2000])
+                .unwrap();
+        assert!(adjacent.query_value("", "V").unwrap().is_some());
     }
 
     fn key_payload(

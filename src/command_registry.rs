@@ -14,7 +14,7 @@ pub const COMMAND_REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const LEAF_COMMAND_CONTRACT_VERSION: u32 = 2;
 pub const LEAF_COMMAND_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EMBEDDED_EQUIVALENCE_SCHEMA_VERSION: u32 = 1;
-pub const EMBEDDED_LEAF_COMMAND_COUNT: usize = 155;
+pub const EMBEDDED_LEAF_COMMAND_COUNT: usize = 179;
 
 const EMBEDDED_EQUIVALENCE_JSON: &str = include_str!("../benchmarks/command-equivalence.json");
 const EMBEDDED_LEAF_COMMAND_MANIFEST_JSON: &str =
@@ -325,6 +325,7 @@ pub enum CommandPlatform {
     Cross,
     Windows,
     Linux,
+    Macos,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +356,7 @@ pub struct EquivalencePrerequisites {
 pub enum PrerequisitePlatform {
     Windows,
     Linux,
+    Macos,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -469,6 +471,7 @@ impl EquivalenceRecord {
                 self.prerequisites.platform == [PrerequisitePlatform::Windows]
             }
             CommandPlatform::Linux => self.prerequisites.platform == [PrerequisitePlatform::Linux],
+            CommandPlatform::Macos => self.prerequisites.platform == [PrerequisitePlatform::Macos],
             CommandPlatform::Cross => {
                 self.prerequisites.platform
                     == [PrerequisitePlatform::Windows, PrerequisitePlatform::Linux]

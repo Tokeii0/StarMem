@@ -77,6 +77,8 @@ Use `starmem --help-en` for the English command list and `starmem <command> --he
 
 ### Image formats
 
+Version 0.2.2 incorporates the Lovelymem V3 engine. See the [V3 synchronization record](docs/V3_SYNC.md) for added capabilities, retained differences, and experimental macOS command limits.
+
 StarMem primarily analyzes **x86-64** guest systems. Some Windows commands support x86 PAE, depending on the plugin.
 
 | Validation status | Format |
@@ -100,6 +102,7 @@ Set `STARMEM_SYMBOL_PATH` for shared read-only symbol roots. Use `--cache` or `S
 | --- | --- |
 | JSON report | `--json`. Plugin results appear in `data` inside the [Evidence Envelope v1](schemas/evidence-envelope-v1.schema.json). |
 | CSV report | `--csv <file>`. Writes UTF-8 CSV by report section. Use `--csv -` for stdout. |
+| Terminal warnings | Hidden by default; enable with `--show-warnings`. JSON/CSV always retain warning and completeness metadata. |
 | Raw evidence objects | `--json --raw-objects <file.jsonl>`. Sorts supported objects by `evidence_id`. See [Raw Object v1](schemas/raw-object-v1.schema.json). |
 | SQLite collection | `collect --db <file>`. Reuses the image context to run applicable read-only plugins. |
 

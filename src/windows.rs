@@ -16,7 +16,9 @@ use crate::symbols::{
 
 pub mod autorun_plugins;
 pub mod check_pslist;
+pub mod compressed_store;
 pub mod console_plugins;
+pub mod desktop_pixels;
 pub mod desktop_reconstruct;
 pub mod disk_plugins;
 pub mod dwm_surfaces;
@@ -26,6 +28,7 @@ pub mod gui_plugins;
 pub mod injected_regions;
 pub mod kernel_plugins;
 pub mod logon_plugins;
+pub mod mailslot_plugins;
 pub mod malware_plugins;
 pub mod netstat_plugins;
 pub mod object_plugins;
@@ -39,6 +42,7 @@ pub mod process_string;
 pub mod registry;
 pub mod service_plugins;
 pub mod shimcache_plugins;
+pub mod symbolless;
 pub mod syscall_plugins;
 pub mod system_plugins;
 pub mod token_plugins;
@@ -161,6 +165,26 @@ impl WindowsKernelContext {
                 ps_active_rva,
                 ps_loaded_rva,
             ) {
+                // Exact symbols already identify both global lists. Validate them
+                // before paying for a full-image System string scan; damaged or
+                // compatible layouts retain the existing recovery path below.
+                let direct = Self {
+                    architecture: WindowsArchitecture::X86_64,
+                    directory_table_base,
+                    kernel_base,
+                    ps_active_process_head: kernel_base + ps_active_rva,
+                    ps_loaded_module_list: kernel_base + ps_loaded_rva,
+                    discovery_method: KernelDiscoveryMethod::LowStub,
+                };
+                if codeview_from_virtual_pe(image, directory_table_base, kernel_base).is_ok_and(
+                    |record| {
+                        record.guid.eq_ignore_ascii_case(&profile.pdb_guid)
+                            && record.age == profile.pdb_age
+                    },
+                ) && validate_kernel_context(image, &direct, profile)
+                {
+                    return Ok(direct);
+                }
                 let actual_ps_active =
                     discover_active_process_head(image, profile, directory_table_base, kernel_base)
                         .unwrap_or(kernel_base + ps_active_rva);

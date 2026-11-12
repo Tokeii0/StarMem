@@ -163,7 +163,7 @@ impl LinuxVfsProfile {
     fn from_isf(isf: &crate::linux_symbols::LinuxIsf) -> Result<Self> {
         let (dentry_child_node, dentry_children_head, dentry_children_kind) =
             if let (Some(child), Some(children)) = (
-                isf.optional_field_offset("dentry", "d_child")?,
+                isf.optional_field_offset_any("dentry", &["d_child", "d_u.d_child"])?,
                 isf.optional_field_offset("dentry", "d_subdirs")?,
             ) {
                 (child, children, DentryChildrenKind::List)
@@ -359,6 +359,10 @@ pub fn scan_files(
     discovery_scan_gib_per_second: f64,
     limit: usize,
 ) -> Result<LinuxFileScanReport> {
+    ensure!(
+        kernel.system_map.is_none() || kernel.symbol_table.is_some(),
+        "System.map 不包含 VFS 类型；自动补齐尚未找到匹配的 Linux ISF"
+    );
     let profile = if let Some(isf) = kernel.symbol_table.as_deref() {
         LinuxVfsProfile::from_isf(isf).or_else(|isf_error| {
             exact_vfs_profile(&kernel.banner).with_context(|| {
@@ -694,7 +698,8 @@ impl FileScanner<'_> {
             .space
             .read_u64(fs_type + self.profile.file_system_type_name)
             .ok()?;
-        if !is_kernel_pointer(name) {
+        // const char * names may start at any byte, unlike structure pointers.
+        if name < 0xffff_8000_0000_0000 {
             return None;
         }
         read_c_string(&self.space, name, MAX_FILESYSTEM_NAME)
@@ -1580,6 +1585,33 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_names_accept_byte_alignment_without_relaxing_object_pointers() {
+        for valid_name in [false, true] {
+            let profile = synthetic_profile(DentryChildrenKind::List);
+            let mut bytes = synthetic_image(&profile);
+            put_virtual_bytes(&mut bytes, FS_NAME + 3, b"ext4\0");
+            put_virtual_u64(
+                &mut bytes,
+                FS_TYPE,
+                if valid_name { FS_NAME + 3 } else { 0x7103 },
+            );
+            let path = temporary_path("unaligned-fs-name");
+            fs::write(&path, bytes).unwrap();
+            let image = MemoryImage::open(&path).unwrap();
+            let report =
+                scan_files_with_profile(&image, &synthetic_kernel(), profile, 0, 0.0, 0.0, 10)
+                    .unwrap();
+            assert!(report.complete);
+            assert_eq!(
+                report.records[0].filesystem.as_deref(),
+                valid_name.then_some("ext4")
+            );
+            drop(image);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn rejects_an_unaligned_superblock_head_before_honoring_limit() {
         let path = temporary_path("files-bad-head");
         let profile = synthetic_profile(DentryChildrenKind::List);
@@ -1793,6 +1825,7 @@ mod tests {
             task_struct_size: 0,
             task_struct_offsets: Default::default(),
             symbol_table: None,
+            system_map: None,
         }
     }
 

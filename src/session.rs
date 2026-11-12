@@ -12,7 +12,7 @@ use crate::browser_session::{
 use crate::cancellation::CancellationToken;
 use crate::clipboard::{
     ClipboardScanOptions, ClipboardScanReport, ClipboardScanStage, ResidualScanOptions,
-    ResidualScanReport, ResidualScanStage, scan_clipboard, scan_residual_text,
+    ResidualScanReport, ResidualScanStage, scan_clipboard_cancellable, scan_residual_text,
 };
 use crate::cobaltstrike::{
     CobaltStrikeScanOptions, CobaltStrikeScanReport, scan_cobaltstrike_configs,
@@ -26,8 +26,13 @@ use crate::packet_scan::{
     PacketScanArtifacts, PacketScanOptions, PacketScanStage, scan_memory_packets,
 };
 use crate::process_dump::{ProcessMemoryDumpReport, dump_process_memory_with_force};
+use crate::profile::compiled::{CompiledProfileFile, is_compiled_path};
 use crate::profile::{KernelProfile, build_eprocess_profile, legacy_windows_profile};
-use crate::symbols::{SymbolStore, default_symbol_store, resolve_kernel_pdb_with_store};
+use crate::symbols::{
+    CodeViewRecord, SymbolStore, cached_kernel_codeview, codeview_from_address_space,
+    default_symbol_store, discover_kernel_codeviews_cancellable, remember_kernel_codeview,
+    resolve_kernel_pdb_with_store, resolve_kernel_record,
+};
 use crate::system::credentials::{
     CachedumpRecord, HashdumpRecord, LsaSecretRecord, cachedump, hashdump, lsadump,
 };
@@ -71,6 +76,7 @@ use crate::windows::kernel_plugins::{
     scan_modules, ssdt, unloaded_modules,
 };
 use crate::windows::logon_plugins::{LogonSessionOptions, LogonSessionReport, scan_logon_sessions};
+use crate::windows::mailslot_plugins::{MailslotOptions, MailslotReport, scan_mailslots};
 use crate::windows::malware_plugins::{
     MalfindReport, ProcessImageAnomalyReport, ProcessImageView, malfind, process_image_anomalies,
 };
@@ -220,9 +226,37 @@ impl AnalysisSession {
             "不能同时指定配置文件和 PDB 符号覆盖项"
         );
 
-        let (profile, warnings, symbol_layout_exactness) = load_profile(&image, &options)?;
-        cancellation.check_cancelled()?;
-        let kernel = WindowsKernelContext::discover(&image, &profile)?;
+        let compiled = options
+            .profile
+            .as_deref()
+            .filter(|path| is_compiled_path(path))
+            .map(CompiledProfileFile::open)
+            .transpose()?;
+        let (profile, warnings, symbol_layout_exactness, kernel) = if let Some(file) = &compiled {
+            file.view().require_current_recipe()?;
+            let profile = file.view().to_profile();
+            cancellation.check_cancelled()?;
+            let kernel = WindowsKernelContext::discover(&image, &profile)?;
+            (profile, Vec::new(), SymbolLayoutExactness::Exact, kernel)
+        } else {
+            load_profile_and_kernel(&image, &options, cancellation)?
+        };
+        if let Some(file) = &compiled {
+            // Bind the compiled profile to the actual bootstrapped kernel PE, not an
+            // arbitrary RSDS string elsewhere in physical memory. No compatible fallback.
+            ensure!(
+                !kernel.is_x86_pae(),
+                "SSYM v1 尚未验证 x86 PAE 内核，请使用原有 PDB/JSON 链路"
+            );
+            let record = crate::symbols::codeview_from_virtual_pe(
+                &image,
+                kernel.directory_table_base,
+                kernel.kernel_base,
+            )
+            .context("无法复验 SSYM 对应的目标内核 CodeView 身份")?;
+            file.view()
+                .validate_identity(&record.pdb_name, &record.guid, record.age)?;
+        }
         cancellation.check_cancelled()?;
         Ok(Self {
             image,
@@ -354,7 +388,26 @@ impl AnalysisSession {
     where
         F: FnMut(ClipboardScanStage),
     {
-        scan_clipboard(&self.image, &self.kernel, &self.profile, options, progress)
+        self.clipboard_scan_cancellable(options, &CancellationToken::new(), progress)
+    }
+
+    pub fn clipboard_scan_cancellable<F>(
+        &self,
+        options: &ClipboardScanOptions,
+        cancellation: &CancellationToken,
+        progress: F,
+    ) -> Result<ClipboardScanReport>
+    where
+        F: FnMut(ClipboardScanStage),
+    {
+        scan_clipboard_cancellable(
+            &self.image,
+            &self.kernel,
+            &self.profile,
+            options,
+            cancellation,
+            progress,
+        )
     }
 
     pub fn residual_scan<F>(
@@ -401,8 +454,36 @@ impl AnalysisSession {
         command_histories(&self.image, &self.kernel, &self.profile, limit)
     }
 
+    pub fn command_histories_cancellable(
+        &self,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandHistoryReport> {
+        crate::windows::console_plugins::command_histories_cancellable(
+            &self.image,
+            &self.kernel,
+            &self.profile,
+            limit,
+            cancellation,
+        )
+    }
+
     pub fn consoles(&self, limit: usize) -> Result<ConsoleReport> {
         consoles(&self.image, &self.kernel, &self.profile, limit)
+    }
+
+    pub fn consoles_cancellable(
+        &self,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ConsoleReport> {
+        crate::windows::console_plugins::consoles_cancellable(
+            &self.image,
+            &self.kernel,
+            &self.profile,
+            limit,
+            cancellation,
+        )
     }
 
     pub fn terminal_history<F>(
@@ -1141,6 +1222,20 @@ impl AnalysisSession {
         scan_pipes(&self.image, &self.kernel, &self.profile, options)
     }
 
+    pub fn mailslots(
+        &self,
+        options: &MailslotOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<MailslotReport> {
+        scan_mailslots(
+            &self.image,
+            &self.kernel,
+            &self.profile,
+            options,
+            cancellation,
+        )
+    }
+
     pub fn prefetch(&self, options: &PrefetchScanOptions) -> Result<PrefetchScanReport> {
         scan_prefetch(&self.image, &self.kernel, &self.profile, options)
     }
@@ -1298,78 +1393,217 @@ impl AnalysisSession {
     }
 }
 
-fn load_profile(
+type LoadedKernel = (
+    KernelProfile,
+    Vec<String>,
+    SymbolLayoutExactness,
+    WindowsKernelContext,
+);
+
+fn load_profile_and_kernel(
     image: &MemoryImage,
     options: &SessionOptions,
-) -> Result<(KernelProfile, Vec<String>, SymbolLayoutExactness)> {
-    if let Some(path) = &options.profile {
-        let profile = serde_json::from_reader::<_, KernelProfile>(BufReader::new(
-            File::open(path).with_context(|| format!("无法打开配置文件 {}", path.display()))?,
-        ))?;
-        return Ok((profile, Vec::new(), SymbolLayoutExactness::Exact));
-    }
-    if let Some(path) = &options.pdb {
-        return Ok((
-            build_eprocess_profile(path)?,
-            Vec::new(),
-            SymbolLayoutExactness::Exact,
-        ));
+    cancellation: &CancellationToken,
+) -> Result<LoadedKernel> {
+    let explicit = if let Some(path) = &options.profile {
+        Some(serde_json::from_reader::<_, KernelProfile>(
+            BufReader::new(
+                File::open(path).with_context(|| format!("无法打开配置文件 {}", path.display()))?,
+            ),
+        )?)
+    } else if let Some(path) = &options.pdb {
+        Some(build_eprocess_profile(path)?)
+    } else {
+        None
+    };
+    if let Some(profile) = explicit {
+        cancellation.check_cancelled()?;
+        let kernel = WindowsKernelContext::discover(image, &profile)?;
+        return Ok((profile, Vec::new(), SymbolLayoutExactness::Exact, kernel));
     }
 
-    match resolve_kernel_pdb_with_store(image, &options.symbol_store) {
-        Ok(resolved) => {
-            if let Some(profile) = legacy_windows_profile(
-                &resolved.record.pdb_name,
-                &resolved.record.guid,
-                resolved.record.age,
-            ) {
-                return Ok((
-                    profile,
-                    vec![
-                        "已识别 Windows XP SP2 x86 PAE 精确内核指纹；公共 PDB 不含私有类型，使用受 CodeView GUID 约束的内置基础结构布局"
-                            .to_owned(),
-                    ],
-                    SymbolLayoutExactness::Exact,
-                ));
-            }
-            Ok((
-                build_eprocess_profile(&resolved.path)?,
-                Vec::new(),
-                SymbolLayoutExactness::Exact,
-            ))
+    let store = &options.symbol_store;
+    let mut cached_failure = None;
+    if let Some(record) = cached_kernel_codeview(image, store) {
+        // A cached identity is only a hint; caches written before identity confirmation may be
+        // stale, so it must match the mapped kernel or fall back to a fresh scan.
+        match bootstrap_kernel_record(image, store, &record, true, cancellation) {
+            Ok(loaded) => return Ok(loaded),
+            Err(error) => cached_failure = Some((record, error)),
         }
-        Err(exact_error) if options.allow_compatible_local_symbols => {
-            let system_root = std::env::var_os("SystemRoot")
-                .context("目标内核的精确 PDB 不可用，且未设置 SystemRoot")?;
-            let local_kernel = PathBuf::from(system_root)
-                .join("System32")
-                .join("ntoskrnl.exe");
-            let local_image = MemoryImage::open(&local_kernel).with_context(|| {
-                format!(
-                    "目标内核的精确 PDB 解析失败（{exact_error:#}）；无法打开兼容的本地内核 {}",
-                    local_kernel.display()
-                )
-            })?;
-            let resolved = resolve_kernel_pdb_with_store(&local_image, &options.symbol_store)
-                .with_context(|| {
-                    format!(
-                        "目标内核的精确 PDB 解析失败（{exact_error:#}）；兼容本地符号回退也失败"
-                    )
-                })?;
-            let profile = build_eprocess_profile(&resolved.path)?;
-            let warning = format!(
-                "目标内核的精确 PDB 不可用；正在使用本地 {} 的类型布局 {}，内核全局变量仍从目标镜像推导",
-                local_kernel.display(),
-                profile.pdb_guid
-            );
-            Ok((
-                profile,
-                vec![warning],
-                SymbolLayoutExactness::CompatibleLocal,
-            ))
-        }
-        Err(error) => Err(error),
+        cancellation.check_cancelled()?;
     }
+    let exact_error = match discover_kernel_codeviews_cancellable(image, cancellation) {
+        Ok(mut candidates) => {
+            let verify_identity = candidates.len() > 1;
+            if let Some((record, error)) = cached_failure {
+                candidates.retain(|candidate| candidate != &record);
+                if candidates.is_empty() {
+                    return Err(error);
+                }
+            }
+            match select_bootstrapped_kernel(
+                image,
+                store,
+                &candidates,
+                verify_identity,
+                cancellation,
+            ) {
+                Ok(loaded) => {
+                    remember_kernel_codeview(image, store, &loaded.0);
+                    return Ok(loaded.1);
+                }
+                Err(KernelSelectionError::Bootstrap(error)) => return Err(error),
+                Err(KernelSelectionError::Symbols(error)) => error,
+            }
+        }
+        Err(error) => error,
+    };
+    if !options.allow_compatible_local_symbols {
+        return Err(exact_error);
+    }
+    let (profile, warnings, exactness) = load_compatible_local_profile(store, exact_error)?;
+    cancellation.check_cancelled()?;
+    let kernel = WindowsKernelContext::discover(image, &profile)?;
+    Ok((profile, warnings, exactness, kernel))
+}
+
+enum KernelSelectionError {
+    /// At least one exact PDB was available, but no candidate mapped the running kernel.
+    Bootstrap(anyhow::Error),
+    /// No candidate PDB could be obtained; compatible local symbols may still apply.
+    Symbols(anyhow::Error),
+}
+
+/// Try every physical kernel CodeView identity. A single candidate keeps the historical
+/// behavior; with several, the bootstrapped kernel PE must carry the candidate's identity so a
+/// stray RSDS record from a cached kernel file of another build cannot select the layout.
+fn select_bootstrapped_kernel(
+    image: &MemoryImage,
+    store: &SymbolStore,
+    candidates: &[CodeViewRecord],
+    verify_identity: bool,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(CodeViewRecord, LoadedKernel), KernelSelectionError> {
+    if candidates.is_empty() {
+        return Err(KernelSelectionError::Symbols(anyhow::anyhow!(
+            "物理内存中没有找到匹配的 RSDS CodeView 记录"
+        )));
+    }
+    let mut symbol_errors = Vec::new();
+    let mut bootstrap_errors = Vec::new();
+    for record in candidates {
+        if let Err(error) = cancellation.check_cancelled() {
+            return Err(KernelSelectionError::Bootstrap(error));
+        }
+        let path = match resolve_kernel_record(image, store, record, true) {
+            Ok(path) => path,
+            Err(error) => {
+                symbol_errors.push((record, error));
+                continue;
+            }
+        };
+        match bootstrap_with_pdb(image, record, &path, verify_identity, cancellation) {
+            Ok(loaded) => return Ok((record.clone(), loaded)),
+            Err(error) => bootstrap_errors.push((record, error)),
+        }
+    }
+    let describe = |errors: Vec<(&CodeViewRecord, anyhow::Error)>| {
+        errors
+            .into_iter()
+            .map(|(record, error)| format!("{} {}：{error:#}", record.pdb_name, record.symbol_key))
+            .collect::<Vec<_>>()
+            .join("；")
+    };
+    match (candidates.len(), bootstrap_errors.is_empty()) {
+        (1, false) => Err(KernelSelectionError::Bootstrap(
+            bootstrap_errors.remove(0).1,
+        )),
+        (1, true) => Err(KernelSelectionError::Symbols(symbol_errors.remove(0).1)),
+        (count, false) => Err(KernelSelectionError::Bootstrap(anyhow::anyhow!(
+            "{count} 个内核 CodeView 候选均未能定位并验证当前运行内核：{}",
+            describe(bootstrap_errors.into_iter().chain(symbol_errors).collect())
+        ))),
+        (count, true) => Err(KernelSelectionError::Symbols(anyhow::anyhow!(
+            "{count} 个内核 CodeView 候选均无法获取精确 PDB：{}",
+            describe(symbol_errors)
+        ))),
+    }
+}
+
+fn bootstrap_kernel_record(
+    image: &MemoryImage,
+    store: &SymbolStore,
+    record: &CodeViewRecord,
+    verify_identity: bool,
+    cancellation: &CancellationToken,
+) -> Result<LoadedKernel> {
+    let path = resolve_kernel_record(image, store, record, true)?;
+    bootstrap_with_pdb(image, record, &path, verify_identity, cancellation)
+}
+
+fn bootstrap_with_pdb(
+    image: &MemoryImage,
+    record: &CodeViewRecord,
+    path: &Path,
+    verify_identity: bool,
+    cancellation: &CancellationToken,
+) -> Result<LoadedKernel> {
+    let (profile, warnings) = match legacy_windows_profile(&record.pdb_name, &record.guid, record.age) {
+        Some(profile) => (
+            profile,
+            vec![
+                "已识别 Windows XP SP2 x86 PAE 精确内核指纹；公共 PDB 不含私有类型，使用受 CodeView GUID 约束的内置基础结构布局"
+                    .to_owned(),
+            ],
+        ),
+        None => (build_eprocess_profile(path)?, Vec::new()),
+    };
+    cancellation.check_cancelled()?;
+    let kernel = WindowsKernelContext::discover(image, &profile)?;
+    if verify_identity {
+        let mapped = codeview_from_address_space(&kernel.address_space(image)?, kernel.kernel_base)
+            .context("无法读取已定位内核的 CodeView 身份")?;
+        ensure!(
+            mapped.pdb_name.eq_ignore_ascii_case(&record.pdb_name)
+                && mapped.symbol_key.eq_ignore_ascii_case(&record.symbol_key),
+            "已定位内核的 CodeView 身份 {} {} 与候选不一致",
+            mapped.pdb_name,
+            mapped.symbol_key
+        );
+    }
+    Ok((profile, warnings, SymbolLayoutExactness::Exact, kernel))
+}
+
+fn load_compatible_local_profile(
+    store: &SymbolStore,
+    exact_error: anyhow::Error,
+) -> Result<(KernelProfile, Vec<String>, SymbolLayoutExactness)> {
+    let system_root =
+        std::env::var_os("SystemRoot").context("目标内核的精确 PDB 不可用，且未设置 SystemRoot")?;
+    let local_kernel = PathBuf::from(system_root)
+        .join("System32")
+        .join("ntoskrnl.exe");
+    let local_image = MemoryImage::open(&local_kernel).with_context(|| {
+        format!(
+            "目标内核的精确 PDB 解析失败（{exact_error:#}）；无法打开兼容的本地内核 {}",
+            local_kernel.display()
+        )
+    })?;
+    let resolved = resolve_kernel_pdb_with_store(&local_image, store).with_context(|| {
+        format!("目标内核的精确 PDB 解析失败（{exact_error:#}）；兼容本地符号回退也失败")
+    })?;
+    let profile = build_eprocess_profile(&resolved.path)?;
+    let warning = format!(
+        "目标内核的精确 PDB 不可用；正在使用本地 {} 的类型布局 {}，内核全局变量仍从目标镜像推导",
+        local_kernel.display(),
+        profile.pdb_guid
+    );
+    Ok((
+        profile,
+        vec![warning],
+        SymbolLayoutExactness::CompatibleLocal,
+    ))
 }
 
 fn merge_process_string_session_evidence(

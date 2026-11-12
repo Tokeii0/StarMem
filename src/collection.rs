@@ -8,7 +8,9 @@ use serde::Serialize;
 use serde_json::{Value, json, to_value};
 
 use crate::acquisition::{AcquisitionInfoOptions, analyze_acquisition_info};
-use crate::browser_artifacts::{BrowserArtifactOptions, parse_browser_artifacts};
+use crate::browser_artifacts::{
+    BrowserArtifactOptions, parse_browser_history_artifacts_from_file_scan,
+};
 use crate::browser_session::BrowserSessionOptions;
 use crate::cancellation::{CancellationToken, is_cancellation_error};
 use crate::clipboard::{ClipboardScanOptions, ResidualScanOptions};
@@ -48,6 +50,7 @@ use crate::windows::autorun_plugins::AutorunOptions;
 use crate::windows::check_pslist::CheckPslistOptions;
 use crate::windows::disk_plugins::MftView;
 use crate::windows::injected_regions::InjectedRegionOptions;
+use crate::windows::mailslot_plugins::MailslotOptions;
 use crate::windows::malware_plugins::ProcessImageView;
 use crate::windows::open_files::{OpenFileOptions, scan_open_files};
 use crate::windows::pe_plugins::PeSymbolSource;
@@ -842,6 +845,26 @@ fn run_plugin_cancellable(
         );
     };
     let value = match plugin.name {
+        "clipboardscan" => serialize(session.clipboard_scan_cancellable(
+            &ClipboardScanOptions {
+                limit: options.result_limit,
+                max_data_size: options.max_data_size,
+            },
+            cancellation,
+            |_| {},
+        )?),
+        "cmdscan" => {
+            serialize(session.command_histories_cancellable(options.result_limit, cancellation)?)
+        }
+        "consoles" => serialize(session.consoles_cancellable(options.result_limit, cancellation)?),
+        "mouse-history" => serialize(crate::mouse_history::analyze_mouse_history(
+            session,
+            options.result_limit,
+            cancellation,
+        )?),
+        "mailslots" => {
+            serialize(session.mailslots(&collection_mailslot_options(options), cancellation)?)
+        }
         "pslist" => serialize(session.processes_cancellable(options.result_limit, cancellation)?),
         "psscan" => {
             serialize(session.process_scan_cancellable(options.result_limit, cancellation)?)
@@ -862,6 +885,13 @@ fn run_plugin_cancellable(
         "mft-resident-data" => serialize(session.mft_cancellable(
             MftView::ResidentData,
             options.result_limit,
+            cancellation,
+        )?),
+        "injected-regions" => serialize(session.injected_regions_cancellable(
+            &InjectedRegionOptions {
+                limit: options.result_limit,
+                ..InjectedRegionOptions::default()
+            },
             cancellation,
         )?),
         "cobaltstrikescan" => serialize(session.cobaltstrikescan_cancellable(
@@ -1071,7 +1101,7 @@ fn runnable_plugin_declarations() -> Vec<PluginSpec> {
         ),
         plugin(
             "clipboardscan",
-            "活动剪切板",
+            "剪贴板与历史",
             "命令与交互",
             |session, options| {
                 serialize(session.clipboard_scan(
@@ -1138,19 +1168,24 @@ fn runnable_plugin_declarations() -> Vec<PluginSpec> {
             "网络与应用",
             |session, options| {
                 let files = session.files(options.file_scan_limit)?;
-                let report = parse_browser_artifacts(
+                let report = parse_browser_history_artifacts_from_file_scan(
                     session.image(),
                     session.kernel(),
                     session.profile(),
-                    files.records,
+                    files,
                     &BrowserArtifactOptions {
                         result_limit: options.result_limit,
                         database_limit: 256,
                         max_database_size: options.max_data_size as u64,
                     },
+                    None,
                 )?;
                 Ok(json!({
                     "records": report.visit_history,
+                    "visit_events": report.visit_events,
+                    "download_history": report.download_history,
+                    "database_sources": report.database_sources,
+                    "page_candidates": report.page_candidates,
                     "artifact_files_found": report.artifact_files_found,
                     "databases_parsed": report.databases_parsed,
                     "complete": report.complete,
@@ -1786,6 +1821,18 @@ fn runnable_plugin_declarations() -> Vec<PluginSpec> {
         ),
         plugin("pipescan", "命名管道", "文件与对象", collect_pipes),
         plugin(
+            "mailslots",
+            "Mailslot 邮槽与消息",
+            "文件与对象",
+            collect_mailslots,
+        ),
+        plugin(
+            "mouse-history",
+            "鼠标最近轨迹",
+            "用户交互",
+            collect_mouse_history,
+        ),
+        plugin(
             "prefetchscan",
             "Prefetch 执行记录",
             "执行与时间线",
@@ -1991,6 +2038,35 @@ fn collect_pipes(session: &AnalysisSession, options: &DatabaseCollectionOptions)
     serialize(session.pipes(&pipes)?)
 }
 
+fn collect_mailslots(
+    session: &AnalysisSession,
+    options: &DatabaseCollectionOptions,
+) -> Result<Value> {
+    serialize(session.mailslots(
+        &collection_mailslot_options(options),
+        &CancellationToken::new(),
+    )?)
+}
+
+fn collect_mouse_history(
+    session: &AnalysisSession,
+    options: &DatabaseCollectionOptions,
+) -> Result<Value> {
+    serialize(crate::mouse_history::analyze_mouse_history(
+        session,
+        options.result_limit,
+        &CancellationToken::new(),
+    )?)
+}
+
+fn collection_mailslot_options(options: &DatabaseCollectionOptions) -> MailslotOptions {
+    MailslotOptions {
+        file_limit: options.file_scan_limit,
+        limit: options.result_limit,
+        ..MailslotOptions::default()
+    }
+}
+
 fn collect_prefetch(
     session: &AnalysisSession,
     options: &DatabaseCollectionOptions,
@@ -2133,6 +2209,132 @@ fn truncate_collection_records<T>(
 
 fn skipped_plugin_declarations() -> Vec<SkippedPlugin> {
     vec![
+        skipped(
+            "windows.phys2file",
+            "物理页文件反查",
+            "文件系统",
+            "需要显式物理地址；按 PFN、原型 PTE 与数据节双向归属核对文件对象，不推定已移除的文件名",
+        ),
+        skipped(
+            "macos.ir",
+            "macOS 系统、进程与文件",
+            "macOS",
+            "需要显式转换的 macOS 符号；只分析驻留活动对象链，不进入自动采集",
+        ),
+        skipped(
+            "macos.dumpfile",
+            "macOS 驻留文件恢复",
+            "macOS",
+            "需要显式 macOS 符号与 vnode；缺页产物使用 .partial 并保留恢复范围",
+        ),
+        skipped(
+            "symbolless.registry",
+            "无符号注册表",
+            "无符号基础分析",
+            "需要显式选择 Hive 文件对象与配对；仅解析已恢复稳定数据",
+        ),
+        skipped(
+            "symbolless.system-info",
+            "无符号系统信息",
+            "无符号基础分析",
+            "仅手动读取目标导出和共享页，保留字段缺失、冲突及估算说明",
+        ),
+        skipped(
+            "symbolless.process-context",
+            "无符号进程上下文",
+            "无符号基础分析",
+            "手动恢复经归属核验的原生 AMD64 PEB 参数与环境块，缺页及截断分别报告",
+        ),
+        skipped(
+            "symbolless.process-modules",
+            "无符号进程 DLL",
+            "无符号基础分析",
+            "手动恢复原生 AMD64 加载器链，未覆盖 WOW64、VAD 对照和隐藏模块",
+        ),
+        skipped(
+            "symbolless.pslist",
+            "无符号进程分析",
+            "无符号基础分析",
+            "实验性独立模式，仅手动执行，不进入符号会话或自动采集",
+        ),
+        skipped(
+            "symbolless.filescan",
+            "无符号文件扫描",
+            "无符号基础分析",
+            "实验性文件对象扫描，仅手动执行，保留布局先验和覆盖限制",
+        ),
+        skipped(
+            "symbolless.dumpfile",
+            "无符号文件恢复",
+            "无符号基础分析",
+            "需要指定 FILE_OBJECT，仅恢复可验证范围并保存来源说明",
+        ),
+        skipped(
+            "browser-pages",
+            "浏览器页面与标签页",
+            "浏览器",
+            "手动关联窗口、驻留 URL 与 Session 片段，保留独立进程读取预算",
+        ),
+        skipped(
+            "bitlocker",
+            "BitLocker 检测",
+            "应用痕迹",
+            "加密组件与驻留配置检测仅手动执行，不推定卷状态",
+        ),
+        skipped(
+            "veracrypt",
+            "VeraCrypt 分析",
+            "应用痕迹",
+            "容器与配置候选分析仅手动执行，保留独立恢复预算",
+        ),
+        skipped(
+            "sunlogin",
+            "向日葵远程分析",
+            "应用痕迹",
+            "远控配置与日志仅手动执行，保留独立恢复预算",
+        ),
+        skipped(
+            "anydesk",
+            "AnyDesk 分析",
+            "应用痕迹",
+            "远控配置与日志仅手动执行，保留独立恢复预算",
+        ),
+        skipped(
+            "wps",
+            "WPS 分析",
+            "应用痕迹",
+            "办公配置与最近文档仅手动执行，保留独立恢复预算",
+        ),
+        skipped(
+            "huorong",
+            "火绒报毒分析",
+            "应用痕迹",
+            "手动解析报毒日志、WAL 和进程内存",
+        ),
+        skipped(
+            "ai-chat",
+            "AI 软件与本地对话",
+            "应用痕迹",
+            "手动解析会话存储与进程内存，不推定完整历史",
+        ),
+        skipped(
+            "qqscan",
+            "QQNT 内存取证",
+            "进程",
+            "QQNT 驻留结构恢复仅手动执行，保留独立进程、解析和读取预算",
+        ),
+        skipped(
+            "wechat-chat",
+            "微信聊天取证",
+            "进程",
+            "微信 WCDB 驻留缓存恢复仅手动执行，保留独立缓存归属及缺页限制",
+        ),
+        skipped(
+            "windows.interaction",
+            "Windows 交互痕迹",
+            "用户交互",
+            "版本相关的交互恢复仅手动执行，避免自动下载额外模块符号和重复扫描",
+        ),
         skipped("build-info", "构建身份", "工具", "构建身份不读取内存镜像"),
         skipped("scan", "精确字节扫描", "搜索", "必须提供 --text 或 --hex"),
         skipped(
@@ -2281,6 +2483,12 @@ fn skipped_plugin_declarations() -> Vec<SkippedPlugin> {
             "Linux 进程内存导出",
             "Linux",
             "会写外部文件，必须显式提供 PID 和输出目录",
+        ),
+        skipped(
+            "linux.proc.strings",
+            "Linux 进程堆栈字符串",
+            "Linux",
+            "collect 尚未接入 Linux task-ring session；请定向运行 Linux 命令",
         ),
         skipped(
             "linux.bash",
@@ -2562,6 +2770,7 @@ mod tests {
             "linux.sockstat",
             "linux.proc.maps",
             "linux.proc.dump",
+            "linux.proc.strings",
             "linux.bash",
             "linux.pstree",
             "linux.passwd",

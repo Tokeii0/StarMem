@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::address::{VirtualAddressRegion, X64AddressSpace};
+use crate::address::{VirtualAddressRegion, WindowsAddressSpace, X64AddressSpace};
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 use crate::scan::{ScanPatternSet, scan_pattern_sets};
@@ -261,7 +261,7 @@ where
     progress(CookieScanStage::Databases);
     let database_parse_started = Instant::now();
     let mut cookie_databases_parsed = 0usize;
-    let kernel_space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let kernel_space = kernel.address_space(image)?;
     for candidate in candidates {
         if records.len() >= limit.saturating_mul(4) {
             complete = false;
@@ -316,7 +316,7 @@ where
                 ),
             );
         }
-        let physical_extents = recovery_physical_extents(&dump.extents, &kernel_space);
+        let physical_extents = recovery_physical_extents_windows(&dump.extents, &kernel_space);
         let remaining = limit.saturating_mul(4).saturating_sub(records.len());
         let parsed = match candidate.kind {
             CookieFileKind::Chromium | CookieFileKind::Firefox => {
@@ -357,15 +357,21 @@ where
 
     progress(CookieScanStage::ProcessOwners);
     let owner_mapping_started = Instant::now();
-    let process_address_spaces = associate_process_owners(
-        image,
-        kernel,
-        profile,
-        &mut records,
-        &mut warnings,
-        &mut complete,
-        process_space_limit,
-    )?;
+    let process_address_spaces = if kernel.is_x86_pae() {
+        complete = false;
+        push_warning(&mut warnings, "x86 PAE 已解析驻留 Cookie 文件；运行时 Cookie 的进程反查尚未覆盖，不能据此归属到某个浏览器进程".to_owned());
+        0
+    } else {
+        associate_process_owners(
+            image,
+            kernel,
+            profile,
+            &mut records,
+            &mut warnings,
+            &mut complete,
+            process_space_limit,
+        )?
+    };
     let owner_mapping_seconds = owner_mapping_started.elapsed().as_secs_f64();
     infer_record_browsers(&mut records);
     records.retain(has_sufficient_runtime_evidence);
@@ -410,7 +416,7 @@ where
             .filter(|file| {
                 file.name
                     .as_deref()
-                    .is_some_and(is_chromium_artifact_file_path)
+                    .is_some_and(is_browser_artifact_file_path)
             })
             .collect(),
     })
@@ -819,7 +825,24 @@ fn is_cookie_file_path(path: &str) -> bool {
 }
 
 fn is_browser_evidence_file_path(path: &str) -> bool {
-    is_cookie_file_path(path) || is_chromium_artifact_file_path(path)
+    is_cookie_file_path(path) || is_browser_artifact_file_path(path)
+}
+
+pub(crate) fn is_browser_artifact_file_path(path: &str) -> bool {
+    is_chromium_artifact_file_path(path) || is_firefox_artifact_file_path(path)
+}
+
+pub(crate) fn is_firefox_artifact_file_path(path: &str) -> bool {
+    // These names also work for portable/custom Firefox profiles. The parser
+    // must still verify the Places tables or LoginStore JSON schema.
+    matches!(
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "places.sqlite" | "logins.json"
+    )
 }
 
 pub(crate) fn is_chromium_artifact_file_path(path: &str) -> bool {
@@ -832,7 +855,19 @@ pub(crate) fn is_chromium_artifact_file_path(path: &str) -> bool {
         && (lower.contains("\\user data\\")
             || lower.contains("\\ebwebview\\")
             || lower.contains("\\webview2\\")
-            || lower.contains("\\cef\\"))
+            || lower.contains("\\cef\\")
+            || [
+                "opera software",
+                "360chrome",
+                "360se",
+                "qqbrowser",
+                "sogouexplorer",
+                "bravesoftware",
+                "vivaldi",
+                "chromium",
+            ]
+            .iter()
+            .any(|component| lower.split('\\').any(|part| part == *component)))
 }
 
 pub(crate) fn infer_chromium_browser_from_path(path: &str) -> String {
@@ -844,6 +879,10 @@ pub(crate) fn infer_chromium_browser_from_path(path: &str) -> String {
 
 pub(crate) fn infer_chromium_profile_from_path(path: &str) -> Option<String> {
     infer_profile_from_path(&path.replace('/', "\\"), CookieFileKind::Chromium)
+}
+
+pub(crate) fn infer_firefox_profile_from_path(path: &str) -> Option<String> {
+    infer_profile_from_path(&path.replace('/', "\\"), CookieFileKind::Firefox)
 }
 
 fn cookie_file_kind(lower_path: &str) -> Option<CookieFileKind> {
@@ -937,7 +976,34 @@ fn infer_profile_from_path(path: &str, kind: CookieFileKind) -> Option<String> {
         CookieFileKind::Chromium => parts
             .windows(2)
             .find(|window| window[0].eq_ignore_ascii_case("User Data"))
-            .map(|window| window[1].to_owned()),
+            .filter(|window| {
+                !matches!(
+                    window[1].to_ascii_lowercase().as_str(),
+                    "history" | "login data" | "cookies"
+                )
+            })
+            .map(|window| window[1].to_owned())
+            .or_else(|| {
+                parts
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .find(|part| {
+                        part.eq_ignore_ascii_case("Default")
+                            || part.to_ascii_lowercase().starts_with("profile ")
+                    })
+                    .map(|part| (*part).to_owned())
+            })
+            .or_else(|| {
+                parts
+                    .iter()
+                    .rev()
+                    .find(|part| {
+                        part.to_ascii_lowercase().starts_with("opera ")
+                            && !part.eq_ignore_ascii_case("Opera Software")
+                    })
+                    .map(|part| (*part).to_owned())
+            }),
         CookieFileKind::Firefox => parts
             .windows(2)
             .find(|window| window[0].eq_ignore_ascii_case("Profiles"))
@@ -1016,6 +1082,9 @@ pub(crate) struct SqliteTable {
     /// recovered and additional records were therefore hidden.
     pub(crate) limit_reached: bool,
     pub(crate) page_size: usize,
+    /// Exact sqlite_schema record ranges used to name and decode this table.
+    pub(crate) schema_source_ranges: Vec<SqliteSourceRange>,
+    pub(crate) create_sql: String,
 }
 
 pub(crate) fn parse_sqlite_table(
@@ -1024,6 +1093,138 @@ pub(crate) fn parse_sqlite_table(
     limit: usize,
 ) -> Result<SqliteTable> {
     parse_sqlite_table_ordered(bytes, wanted, limit, SqliteRowOrder::Ascending)
+}
+
+/// Visit allocated table-leaf cells without claiming a table name. This is a
+/// salvage path for missing sqlite_schema pages, not a substitute schema.
+/// The caller supplies resident-byte coverage; sparse recovery zeroes cannot
+/// satisfy either a page or an overflow payload. No index/free-space carving.
+pub(crate) fn visit_resident_sqlite_leaf_rows(
+    bytes: &[u8],
+    resident: impl Fn(u64, u64) -> bool,
+    mut visit: impl FnMut(SqlRow, usize) -> bool,
+) -> Result<()> {
+    ensure!(resident(0, 100), "SQLite 文件头未完整驻留");
+    ensure!(
+        bytes.len() >= 100 && bytes.starts_with(b"SQLite format 3\0"),
+        "SQLite 文件头无效"
+    );
+    let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if raw == 1 { 65536 } else { usize::from(raw) };
+    ensure!(
+        (512..=65536).contains(&page_size) && page_size.is_power_of_two(),
+        "SQLite 页大小无效"
+    );
+    ensure!(
+        bytes[56..60] == [0, 0, 0, 1],
+        "叶页恢复目前只支持 UTF-8 SQLite"
+    );
+    let usable_size = page_size - usize::from(bytes[20]);
+    ensure!(usable_size >= 480, "SQLite 可用页大小无效");
+    let db = SqliteDatabase {
+        bytes,
+        page_size,
+        usable_size,
+    };
+    for (index, page) in bytes.chunks_exact(page_size).enumerate() {
+        let file_offset = (index * page_size) as u64;
+        let header = if index == 0 { 100 } else { 0 };
+        if !resident(file_offset, page_size as u64) || page[header] != 0x0d {
+            continue;
+        }
+        let count = usize::from(read_be_u16(page, header + 3)?);
+        let pointers_end = header + 8 + count * 2;
+        let raw_start = usize::from(read_be_u16(page, header + 5)?);
+        let content_start = if raw_start == 0 { 65536 } else { raw_start };
+        if pointers_end > content_start || content_start > usable_size || page[header + 7] > 60 {
+            continue;
+        }
+        let page_number = u32::try_from(index + 1)?;
+        let mut cells = Vec::with_capacity(count);
+        let mut intervals = Vec::with_capacity(count);
+        let mut valid = true;
+        let mut payload_budget = 8 * 1024 * 1024;
+        for cell_index in 0..count {
+            let cell = usize::from(read_be_u16(page, header + 8 + cell_index * 2)?);
+            if cell < content_start || cell >= usable_size {
+                valid = false;
+                break;
+            }
+            // Limit each unclassified cell before allocating its payload.
+            let Some((size, _)) = read_sqlite_varint(page, cell) else {
+                valid = false;
+                break;
+            };
+            if size > 1024 * 1024 || size > payload_budget {
+                valid = false;
+                break;
+            }
+            payload_budget -= size;
+            let Some(row) = db.parse_leaf_cell(
+                page,
+                page_number,
+                file_offset,
+                cell,
+                file_offset + cell as u64,
+            ) else {
+                valid = false;
+                break;
+            };
+            let local = &row.source_ranges[0];
+            if local.file_offset + local.length > file_offset + usable_size as u64 {
+                valid = false;
+                break;
+            }
+            intervals.push((local.file_offset, local.file_offset + local.length));
+            if row
+                .source_ranges
+                .iter()
+                .all(|r| resident(r.file_offset, r.length))
+            {
+                cells.push(row);
+            }
+        }
+        intervals.sort_unstable();
+        if !valid || intervals.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            continue;
+        }
+        for row in cells {
+            if !visit(row, page_size) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate schema names for bounded application-specific adapters. Callers
+/// must validate recovered page coverage before using this byte view.
+pub(crate) fn sqlite_table_names(bytes: &[u8]) -> Result<Vec<String>> {
+    ensure!(
+        bytes.len() >= 100 && bytes.starts_with(b"SQLite format 3\0"),
+        "SQLite 头不完整"
+    );
+    let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if raw == 1 { 65536 } else { usize::from(raw) };
+    ensure!(
+        (512..=65536).contains(&page_size) && page_size.is_power_of_two(),
+        "SQLite 页大小无效"
+    );
+    let db = SqliteDatabase {
+        bytes,
+        page_size,
+        usable_size: page_size - usize::from(bytes[20]),
+    };
+    Ok(db
+        .table_rows(1, 256)
+        .rows
+        .into_iter()
+        .filter_map(|r| {
+            (sql_text(r.values.first()?)? == "table")
+                .then(|| sql_text(r.values.get(1)?).map(str::to_owned))
+                .flatten()
+        })
+        .collect())
 }
 
 pub(crate) fn parse_sqlite_table_descending(
@@ -1067,7 +1268,7 @@ fn parse_sqlite_table_selected(
     selection: SqliteRowSelection<'_>,
 ) -> Result<SqliteTable> {
     ensure!(
-        bytes.starts_with(b"SQLite format 3\0"),
+        bytes.len() >= 100 && bytes.starts_with(b"SQLite format 3\0"),
         "文件头不是 SQLite 3 数据库"
     );
     let page_size_raw = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
@@ -1099,9 +1300,9 @@ fn parse_sqlite_table_selected(
                 .iter()
                 .any(|wanted| name.eq_ignore_ascii_case(wanted))
             && root > 0)
-            .then(|| (root as u32, sql.to_owned()))
+            .then(|| (root as u32, sql.to_owned(), row.source_ranges.clone()))
     });
-    let (root_page, schema) =
+    let (root_page, schema, schema_source_ranges) =
         table.ok_or_else(|| anyhow::anyhow!("没有找到数据表：{}", wanted.join("/")))?;
     let columns = parse_create_columns(&schema);
     ensure!(!columns.is_empty(), "无法解析 SQLite 数据表字段");
@@ -1122,6 +1323,8 @@ fn parse_sqlite_table_selected(
         damaged_pages,
         limit_reached: rows.limit_reached,
         page_size,
+        schema_source_ranges,
+        create_sql: schema,
     })
 }
 
@@ -1957,9 +2160,9 @@ fn parse_legacy_cookie_text(
     Ok(records)
 }
 
-pub(crate) fn recovery_physical_extents(
+pub(crate) fn recovery_physical_extents_windows(
     extents: &[RecoveredExtent],
-    kernel_space: &X64AddressSpace<'_>,
+    kernel_space: &WindowsAddressSpace<'_>,
 ) -> Vec<RecoveredExtent> {
     let mut output = Vec::new();
     for extent in extents {
@@ -2214,6 +2417,7 @@ pub(crate) fn infer_browser_from_process_context(
     }
     [
         ("chrome.exe", "Chrome"),
+        ("chromium.exe", "Chromium"),
         ("msedge.exe", "Edge"),
         ("firefox.exe", "Firefox"),
         ("brave.exe", "Brave"),
@@ -2223,9 +2427,11 @@ pub(crate) fn infer_browser_from_process_context(
         ("microsoftedge", "旧版 Edge"),
         ("msedgewebview2", "WebView2"),
         ("360chrome.exe", "360 极速浏览器"),
+        ("360chromex.exe", "360 极速浏览器"),
         ("360se.exe", "360 安全浏览器"),
         ("qqbrowser.exe", "QQ 浏览器"),
         ("sogouexplorer.exe", "搜狗浏览器"),
+        ("sogouexplorer.e", "搜狗浏览器"),
     ]
     .into_iter()
     .find_map(|(needle, browser)| process.contains(needle).then(|| browser.to_owned()))

@@ -4,18 +4,22 @@ use std::time::Instant;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 
-use crate::address::X64AddressSpace;
+use crate::address::WindowsAddressSpace;
 use crate::cookies::{
     chromium_time, infer_chromium_browser_from_path, infer_chromium_profile_from_path,
-    is_chromium_artifact_file_path, parse_sqlite_table, parse_sqlite_table_by_rowids,
-    parse_sqlite_table_descending, physical_for_file_offset, recovery_physical_extents, sql_blob,
-    sql_integer, sql_text,
+    infer_firefox_profile_from_path, is_browser_artifact_file_path, is_firefox_artifact_file_path,
+    parse_sqlite_table, parse_sqlite_table_by_rowids, parse_sqlite_table_descending,
+    physical_for_file_offset, sql_blob, sql_integer, sql_text,
 };
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 use crate::windows::WindowsKernelContext;
-use crate::windows::files::{DumpSource, FileScanRecord, FileScanReport, recover_file_bytes};
+use crate::windows::files::{FileScanRecord, FileScanReport};
 use crate::windows::plugins::find_handle_owners;
+
+mod firefox;
+mod recovery;
+pub use recovery::{BrowserCandidateRange, BrowserDatabaseSource, BrowserPageCandidate};
 
 const MAX_WARNING_COUNT: usize = 64;
 const MAX_TEXT_LENGTH: usize = 16 * 1024;
@@ -38,6 +42,9 @@ pub struct BrowserDownloadHistoryRecord {
     pub browser: String,
     pub profile: Option<String>,
     pub download_id: i64,
+    /// Firefox Places annotations describe the latest metadata for a URL,
+    /// rather than an individually identified download transaction.
+    pub record_kind: &'static str,
     pub source_url: Option<String>,
     pub url_chain: Vec<String>,
     pub website: Option<String>,
@@ -69,9 +76,9 @@ pub struct BrowserVisitHistoryRecord {
     pub domain: Option<String>,
     pub title: Option<String>,
     pub url_id: i64,
-    /// Legacy Chromium `urls.visit_count` field retained for JSON compatibility.
+    /// Legacy aggregate field retained for JSON compatibility.
     pub visit_count: Option<i64>,
-    /// Explicit name for Chromium's aggregate count.  This is not the number
+    /// Explicit name for the browser's aggregate count. This is not the number
     /// of individual `visits` rows StarMem happened to recover, and Chromium
     /// may intentionally apply different accounting rules (for example reloads).
     pub aggregate_visit_count: Option<i64>,
@@ -129,8 +136,9 @@ pub struct BrowserVisitEventRecord {
     pub url: Option<String>,
     pub domain: Option<String>,
     pub title: Option<String>,
-    /// Raw Chromium/WebKit microseconds since 1601-01-01 UTC.
+    /// Interpret using visit_time_basis, never compare different raw epochs.
     pub visit_time_raw: Option<i64>,
+    pub visit_time_basis: &'static str,
     pub visit_time_utc: Option<String>,
     pub transition_raw: Option<i64>,
     pub transition_core: Option<String>,
@@ -201,6 +209,8 @@ pub struct BrowserLoginAccountRecord {
     pub signon_realm: Option<String>,
     pub username: String,
     pub username_kind: String,
+    pub source_format: &'static str,
+    pub source_json_pointer: Option<String>,
     /// 仅表示数据库中存在非空密码密文；绝不导出、解密或序列化密码内容。
     pub password_stored: bool,
     pub date_created: Option<String>,
@@ -219,6 +229,8 @@ pub struct BrowserArtifactReport {
     pub visit_events: Vec<BrowserVisitEventRecord>,
     pub download_history: Vec<BrowserDownloadHistoryRecord>,
     pub login_accounts: Vec<BrowserLoginAccountRecord>,
+    pub database_sources: Vec<BrowserDatabaseSource>,
+    pub page_candidates: Vec<BrowserPageCandidate>,
     pub artifact_owners: Vec<BrowserArtifactOwnerRecord>,
     pub artifact_owner_scan: Option<BrowserArtifactOwnerScan>,
     pub artifact_files_found: usize,
@@ -252,6 +264,8 @@ impl BrowserArtifactReport {
 enum ArtifactKind {
     History,
     LoginData,
+    FirefoxPlaces,
+    FirefoxLogins,
 }
 
 struct ArtifactCandidate {
@@ -298,7 +312,10 @@ pub fn parse_browser_history_artifacts(
                 .as_deref()
                 .map(|path| path.replace('/', "\\"))
                 .and_then(|path| path.rsplit('\\').next().map(str::to_owned))
-                .is_some_and(|base| base.eq_ignore_ascii_case("history"))
+                .is_some_and(|base| {
+                    base.eq_ignore_ascii_case("history")
+                        || base.eq_ignore_ascii_case("places.sqlite")
+                })
         })
         .collect();
     parse_browser_artifacts_with_owners(image, kernel, profile, files, options, owner_options)
@@ -397,11 +414,13 @@ pub fn parse_browser_artifacts_with_owners(
             });
     }
 
-    let kernel_space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let kernel_space = kernel.address_space(image)?;
     let mut visit_history = Vec::new();
     let mut visit_events = Vec::new();
     let mut download_history = Vec::new();
     let mut login_accounts = Vec::new();
+    let mut database_sources = Vec::new();
+    let mut page_candidates = Vec::new();
     let mut databases_parsed = 0usize;
     for candidate in candidates {
         if visit_history.len() >= options.result_limit
@@ -413,69 +432,80 @@ pub fn parse_browser_artifacts_with_owners(
             push_warning(&mut warnings, "浏览器证据结果达到安全上限".to_owned());
             break;
         }
-        let recovered = recover_file_bytes(
+        let recovered = recovery::recover_database(
             image,
             kernel,
             profile,
-            candidate.file.file_object,
-            DumpSource::Auto,
+            &kernel_space,
+            &candidate,
             options.max_database_size,
+            &mut database_sources,
         );
-        let (dump, bytes) = match recovered {
-            Ok(value) => value,
-            Err(error) => {
-                complete = false;
-                push_warning(
-                    &mut warnings,
-                    format!("无法恢复浏览器数据库 {}：{error:#}", candidate.path),
-                );
-                continue;
-            }
-        };
-        if dump.recovered_bytes == 0 || bytes.is_empty() {
+        let Some((dump, bytes, extents, source)) = recovered else {
             complete = false;
             push_warning(
                 &mut warnings,
-                format!("浏览器数据库 {} 没有驻留内容", candidate.path),
+                format!(
+                    "浏览器数据库 {} 的缓存、数据节均未取得内容；读取状态见 database_sources",
+                    candidate.path
+                ),
             );
             continue;
-        }
+        };
         if !dump.complete {
             complete = false;
             push_warning(
                 &mut warnings,
                 format!(
-                    "浏览器数据库 {} 仅恢复 {}/{} 字节",
-                    candidate.path, dump.recovered_bytes, dump.logical_size
+                    "浏览器数据库 {} 选用 {source} 来源，恢复 {}/{} 字节；各来源独立核对，未拼接缺页",
+                    candidate.path, dump.recovered_bytes, dump.logical_size,
                 ),
             );
         }
-        let extents = recovery_physical_extents(&dump.extents, &kernel_space);
+        if candidate.kind != ArtifactKind::FirefoxLogins
+            && !file_range_fully_recovered(&extents, 0, 100)
+        {
+            complete = false;
+            push_warning(
+                &mut warnings,
+                format!(
+                    "浏览器数据库 {} 的 SQLite 文件头未驻留，不能判断原文件格式或将补零当作文件头",
+                    candidate.path
+                ),
+            );
+            continue;
+        }
         let parsed = match candidate.kind {
-            ArtifactKind::History => parse_history_database(
-                &bytes,
-                &candidate,
-                &extents,
-                dump.complete,
-                options.result_limit.saturating_sub(visit_history.len()),
-                options.result_limit.saturating_sub(visit_events.len()),
-                options.result_limit.saturating_sub(download_history.len()),
-            )
-            .map(|mut parsed| {
-                if !parsed.complete {
-                    complete = false;
-                }
-                for warning in parsed.warnings.drain(..) {
-                    push_warning(
-                        &mut warnings,
-                        format!("浏览器数据库 {}：{warning}", candidate.path),
-                    );
-                }
-                visit_history.append(&mut parsed.visit_history);
-                visit_events.append(&mut parsed.visit_events);
-                download_history.append(&mut parsed.download_history);
-                parsed.damaged_pages
-            }),
+            ArtifactKind::History | ArtifactKind::FirefoxPlaces => {
+                (if candidate.kind == ArtifactKind::FirefoxPlaces {
+                    firefox::parse_places_database
+                } else {
+                    parse_history_database
+                })(
+                    &bytes,
+                    &candidate,
+                    &extents,
+                    dump.complete,
+                    options.result_limit.saturating_sub(visit_history.len()),
+                    options.result_limit.saturating_sub(visit_events.len()),
+                    options.result_limit.saturating_sub(download_history.len()),
+                )
+                .map(|mut parsed| {
+                    if !parsed.complete {
+                        complete = false;
+                    }
+                    for warning in parsed.warnings.drain(..) {
+                        push_warning(
+                            &mut warnings,
+                            format!("浏览器数据库 {}：{warning}", candidate.path),
+                        );
+                    }
+                    visit_history.append(&mut parsed.visit_history);
+                    visit_events.append(&mut parsed.visit_events);
+                    download_history.append(&mut parsed.download_history);
+                    parsed.damaged_pages
+                })
+            }
             ArtifactKind::LoginData => parse_login_database(
                 &bytes,
                 &candidate,
@@ -486,7 +516,26 @@ pub fn parse_browser_artifacts_with_owners(
                 login_accounts.append(&mut records);
                 damaged
             }),
+            ArtifactKind::FirefoxLogins => firefox::parse_logins_json(
+                &bytes,
+                &candidate,
+                &extents,
+                dump.complete,
+                options.result_limit.saturating_sub(login_accounts.len()),
+            )
+            .map(|(mut records, parsed_complete, parsed_warnings)| {
+                complete &= parsed_complete;
+                for warning in parsed_warnings {
+                    push_warning(
+                        &mut warnings,
+                        format!("浏览器账号文件 {}：{warning}", candidate.path),
+                    );
+                }
+                login_accounts.append(&mut records);
+                0
+            }),
         };
+        let needs_salvage = !dump.complete || parsed.is_err();
         match parsed {
             Ok(damaged_pages) => {
                 databases_parsed += 1;
@@ -509,6 +558,47 @@ pub fn parse_browser_artifacts_with_owners(
                 );
             }
         }
+        if candidate.kind == ArtifactKind::History && needs_salvage {
+            match recovery::salvage_history(
+                &bytes,
+                &candidate,
+                &extents,
+                &source,
+                options.result_limit.saturating_sub(page_candidates.len()),
+            ) {
+                Ok((mut records, truncated)) => {
+                    records.retain(|row| {
+                        !visit_history.iter().any(|known| {
+                            known.file_object == row.file_object
+                                && known.database_rowid == row.database_rowid
+                                && known.url == row.url
+                        })
+                    });
+                    if !records.is_empty() {
+                        push_warning(
+                            &mut warnings,
+                            format!(
+                                "浏览器数据库 {} 从完整驻留叶页恢复 {} 条网址候选；表归属未确认，不计入已解析访问历史",
+                                candidate.path,
+                                records.len()
+                            ),
+                        );
+                    }
+                    page_candidates.append(&mut records);
+                    if truncated {
+                        complete = false;
+                        push_warning(&mut warnings, "浏览器叶页候选达到结果上限".to_owned());
+                    }
+                }
+                Err(error) => push_warning(
+                    &mut warnings,
+                    format!(
+                        "浏览器数据库 {} 无法进行叶页恢复：{error:#}",
+                        candidate.path
+                    ),
+                ),
+            }
+        }
     }
 
     visit_history.sort_unstable_by(|left, right| {
@@ -519,14 +609,15 @@ pub fn parse_browser_artifacts_with_owners(
             .then_with(|| left.url.cmp(&right.url))
     });
     visit_history.dedup_by(|left, right| {
-        left.url.eq_ignore_ascii_case(&right.url)
+        left.url == right.url
             && left.browser == right.browser
             && left.profile == right.profile
+            && left.file_object == right.file_object
+            && left.source_file.eq_ignore_ascii_case(&right.source_file)
     });
     visit_events.sort_unstable_by(|left, right| {
-        right
-            .visit_time_raw
-            .cmp(&left.visit_time_raw)
+        visit_unix_microseconds(right)
+            .cmp(&visit_unix_microseconds(left))
             .then_with(|| left.browser.cmp(&right.browser))
             .then_with(|| left.source_file.cmp(&right.source_file))
             .then_with(|| left.visit_id.cmp(&right.visit_id))
@@ -549,6 +640,7 @@ pub fn parse_browser_artifacts_with_owners(
         left.browser == right.browser
             && left.profile == right.profile
             && left.download_id == right.download_id
+            && left.file_object == right.file_object
             && left.source_file.eq_ignore_ascii_case(&right.source_file)
     });
     login_accounts.sort_unstable_by(|left, right| {
@@ -562,6 +654,10 @@ pub fn parse_browser_artifacts_with_owners(
             && left.username.eq_ignore_ascii_case(&right.username)
             && left.browser == right.browser
             && left.profile == right.profile
+            && left.file_object == right.file_object
+            && left.source_file.eq_ignore_ascii_case(&right.source_file)
+            && (left.source_format != "firefox_logins_json"
+                || left.database_rowid == right.database_rowid)
     });
 
     let output_truncated = visit_history.len() > options.result_limit
@@ -687,6 +783,8 @@ pub fn parse_browser_artifacts_with_owners(
         visit_events,
         download_history,
         login_accounts,
+        database_sources,
+        page_candidates,
         artifact_owners,
         artifact_owner_scan,
         artifact_files_found,
@@ -699,18 +797,28 @@ pub fn parse_browser_artifacts_with_owners(
 
 fn classify_artifact_file(file: FileScanRecord) -> Option<ArtifactCandidate> {
     let path = file.name.as_deref()?.replace('/', "\\");
-    if !is_chromium_artifact_file_path(&path) {
+    if !is_browser_artifact_file_path(&path) {
         return None;
     }
     let kind = match path.rsplit('\\').next()?.to_ascii_lowercase().as_str() {
         "history" => ArtifactKind::History,
         "login data" => ArtifactKind::LoginData,
+        "places.sqlite" => ArtifactKind::FirefoxPlaces,
+        "logins.json" => ArtifactKind::FirefoxLogins,
         _ => return None,
     };
     Some(ArtifactCandidate {
         kind,
-        browser: infer_chromium_browser_from_path(&path),
-        profile: infer_chromium_profile_from_path(&path),
+        browser: if is_firefox_artifact_file_path(&path) {
+            "Firefox".to_owned()
+        } else {
+            infer_chromium_browser_from_path(&path)
+        },
+        profile: if is_firefox_artifact_file_path(&path) {
+            infer_firefox_profile_from_path(&path)
+        } else {
+            infer_chromium_profile_from_path(&path)
+        },
         path,
         file,
     })
@@ -940,6 +1048,7 @@ fn parse_history_database(
                     domain: url_details.and_then(|details| details.domain.clone()),
                     title: url_details.and_then(|details| details.title.clone()),
                     visit_time_raw,
+                    visit_time_basis: "windows_epoch_microseconds",
                     visit_time_utc: visit_time_raw.and_then(chromium_time),
                     transition_raw,
                     transition_core,
@@ -1074,6 +1183,7 @@ fn parse_history_database(
                     browser: candidate.browser.clone(),
                     profile: candidate.profile.clone(),
                     download_id,
+                    record_kind: "download_record",
                     source_url,
                     url_chain: chain,
                     website,
@@ -1126,6 +1236,20 @@ fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::History => "history",
         ArtifactKind::LoginData => "login_data",
+        ArtifactKind::FirefoxPlaces => "firefox_places",
+        ArtifactKind::FirefoxLogins => "firefox_logins_json",
+    }
+}
+
+fn visit_unix_microseconds(event: &BrowserVisitEventRecord) -> Option<i64> {
+    let raw = event.visit_time_raw?;
+    if raw <= 0 {
+        return None;
+    }
+    match event.visit_time_basis {
+        "windows_epoch_microseconds" => raw.checked_sub(11_644_473_600_000_000),
+        "unix_epoch_microseconds" => Some(raw),
+        _ => None,
     }
 }
 
@@ -1278,6 +1402,8 @@ fn parse_login_database(
                     "username".to_owned()
                 },
                 username,
+                source_format: "sqlite",
+                source_json_pointer: None,
                 password_stored: value(&["password_value"])
                     .and_then(sql_blob)
                     .is_some_and(|bytes| !bytes.is_empty()),
@@ -1795,6 +1921,8 @@ mod tests {
             visit_events: Vec::new(),
             download_history: Vec::new(),
             login_accounts: Vec::new(),
+            database_sources: Vec::new(),
+            page_candidates: Vec::new(),
             artifact_owners: Vec::new(),
             artifact_owner_scan: None,
             artifact_files_found: 0,
@@ -1843,7 +1971,7 @@ mod tests {
         );
     }
 
-    fn candidate(kind: ArtifactKind, base: &str) -> ArtifactCandidate {
+    pub(super) fn candidate(kind: ArtifactKind, base: &str) -> ArtifactCandidate {
         ArtifactCandidate {
             kind,
             browser: "Chrome".to_owned(),

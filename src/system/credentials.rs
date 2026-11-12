@@ -161,7 +161,24 @@ pub fn hashdump_from_hives(
         let Ok(rid) = u32::from_str_radix(&key.name, 16) else {
             continue;
         };
-        let Some(value) = sam_hive.value_by_name(&key, "V")? else {
+        let values = match sam_hive.values_best_effort(&key) {
+            Ok(values) => values,
+            Err(error) => {
+                warnings.push(format!("cannot read SAM RID {rid} values: {error:#}"));
+                continue;
+            }
+        };
+        warnings.extend(
+            values
+                .warnings
+                .into_iter()
+                .map(|warning| format!("SAM RID {rid}: {warning}")),
+        );
+        let Some(value) = values
+            .values
+            .into_iter()
+            .find(|value| value.name.eq_ignore_ascii_case("V"))
+        else {
             warnings.push(format!("SAM RID {rid} has no V value"));
             continue;
         };
@@ -175,7 +192,7 @@ pub fn hashdump_from_hives(
             Err(error) => warnings.push(format!("cannot decode SAM RID {rid}: {error:#}")),
         }
     }
-    let complete = records.len() < limit && warnings.is_empty();
+    let complete = warnings.is_empty();
     Ok(RegistryEvidence {
         available: true,
         complete,
@@ -204,8 +221,23 @@ pub fn lsadump(
             warnings,
         });
     };
-    let bootkey = bootkey(&system_hive).context("cannot reconstruct SYSTEM boot key")?;
-    let (lsa_key, modern) = match lsa_key(&security_hive, &bootkey) {
+    let mut evidence = lsadump_from_hives(&system_hive, &security_hive, limit)?;
+    evidence.complete &= system.complete && security.complete;
+    warnings.append(&mut evidence.warnings);
+    evidence.warnings = warnings;
+    Ok(evidence)
+}
+
+/// Decode already recovered Hive bytes; callers retain acquisition completeness and identity.
+pub fn lsadump_from_hives(
+    system_hive: &RegistryHive,
+    security_hive: &RegistryHive,
+    limit: usize,
+) -> Result<RegistryEvidence<LsaSecretRecord>> {
+    ensure!(limit > 0, "lsadump result limit must be greater than zero");
+    let mut warnings = Vec::new();
+    let bootkey = bootkey(system_hive).context("cannot reconstruct SYSTEM boot key")?;
+    let (lsa_key, modern) = match lsa_key(security_hive, &bootkey) {
         Ok(value) => value,
         Err(error) => {
             warnings.push(format!(
@@ -230,7 +262,7 @@ pub fn lsadump(
             warnings.push(format!("lsadump result limit {limit} reached"));
             break;
         }
-        match secret_by_name(&security_hive, &secret_key.name, &lsa_key, modern) {
+        match secret_by_name(security_hive, &secret_key.name, &lsa_key, modern) {
             Ok(Some(secret)) => records.push(LsaSecretRecord {
                 name: secret_key.name,
                 utf16: plausible_utf16_secret(&secret),
@@ -245,7 +277,7 @@ pub fn lsadump(
     }
     Ok(RegistryEvidence {
         available: true,
-        complete: system.complete && security.complete && records.len() < limit,
+        complete: warnings.is_empty(),
         records,
         warnings,
     })
@@ -274,8 +306,26 @@ pub fn cachedump(
             warnings,
         });
     };
-    let bootkey = bootkey(&system_hive).context("cannot reconstruct SYSTEM boot key")?;
-    let (lsa_key, modern) = match lsa_key(&security_hive, &bootkey) {
+    let mut evidence = cachedump_from_hives(&system_hive, &security_hive, limit)?;
+    evidence.complete &= system.complete && security.complete;
+    warnings.append(&mut evidence.warnings);
+    evidence.warnings = warnings;
+    Ok(evidence)
+}
+
+/// Decode cached logons from an explicitly paired SYSTEM and SECURITY acquisition.
+pub fn cachedump_from_hives(
+    system_hive: &RegistryHive,
+    security_hive: &RegistryHive,
+    limit: usize,
+) -> Result<RegistryEvidence<CachedumpRecord>> {
+    ensure!(
+        limit > 0,
+        "cachedump result limit must be greater than zero"
+    );
+    let mut warnings = Vec::new();
+    let bootkey = bootkey(system_hive).context("cannot reconstruct SYSTEM boot key")?;
+    let (lsa_key, modern) = match lsa_key(security_hive, &bootkey) {
         Ok(value) => value,
         Err(error) => {
             warnings.push(format!(
@@ -289,13 +339,15 @@ pub fn cachedump(
             });
         }
     };
-    let nlkm = secret_by_name(&security_hive, "NL$KM", &lsa_key, modern)?
+    let nlkm = secret_by_name(security_hive, "NL$KM", &lsa_key, modern)?
         .context("LSA NL$KM secret is absent")?;
     let cache = security_hive
         .open_key("Cache")?
         .context("SECURITY Cache key is absent")?;
     let mut records = Vec::new();
-    for value in security_hive.values(&cache)? {
+    let enumeration = security_hive.values_best_effort(&cache)?;
+    warnings.extend(enumeration.warnings);
+    for value in enumeration.values {
         if value.name.eq_ignore_ascii_case("NL$Control") || value.raw_data().len() < 96 {
             continue;
         }
@@ -311,7 +363,7 @@ pub fn cachedump(
     }
     Ok(RegistryEvidence {
         available: true,
-        complete: system.complete && security.complete && records.len() < limit,
+        complete: warnings.is_empty(),
         records,
         warnings,
     })
@@ -319,7 +371,11 @@ pub fn cachedump(
 
 fn bootkey(system: &RegistryHive) -> Result<[u8; 16]> {
     let current = system
-        .query_value("Select", "Current")?
+        // Select is a discovery hint, not BootKey material. A missing Select
+        // page must not prevent checking complete ControlSetNNN siblings.
+        .query_value("Select", "Current")
+        .ok()
+        .flatten()
         .and_then(|value| value.as_u32());
     let root = system.root()?;
     let enumeration = system.subkeys_best_effort(&root)?;
@@ -379,7 +435,8 @@ fn bootkey_from_control_set(system: &RegistryHive, control_set: u32) -> Result<[
             .with_context(|| format!("SYSTEM {base}\\{name} is absent"))?;
         encoded.push_str(
             system
-                .key_class(&key)?
+                .key_class(&key)
+                .with_context(|| format!("cannot read SYSTEM {base}\\{name} class"))?
                 .as_deref()
                 .with_context(|| format!("SYSTEM {name} class is absent"))?,
         );
@@ -513,7 +570,7 @@ fn decrypt_sam_hash(
         .context("SAM hash range overflow")?;
     ensure!(end <= data.len(), "SAM hash blob is truncated");
     ensure!(length >= 4, "SAM hash header is truncated");
-    let revision = data[offset + 2];
+    let revision = le_u16(data, offset + 2)?;
     let obfuscated = match revision {
         1 => {
             if length == 4 {
@@ -848,6 +905,10 @@ fn le_u32(data: &[u8], offset: usize) -> Result<u32> {
 }
 
 #[cfg(test)]
+#[path = "credentials_tests.rs"]
+pub(crate) mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -895,5 +956,9 @@ mod tests {
         malformed_aes[2] = 2;
         malformed_aes[4..8].copy_from_slice(&8u32.to_le_bytes());
         assert!(decrypt_sam_hash(500, &malformed_aes, 0, 24, &hbootkey, NT_PASSWORD).is_err());
+
+        let mut unknown_revision = legacy_absent;
+        unknown_revision[3] = 1;
+        assert!(decrypt_sam_hash(500, &unknown_revision, 0, 4, &hbootkey, NT_PASSWORD).is_err());
     }
 }

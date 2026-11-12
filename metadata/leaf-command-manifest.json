@@ -2,6 +2,983 @@
   "$schema": "../schemas/leaf-command-manifest-v1.schema.json",
   "schema_version": 1,
   "commands": {
+    "macos.ir": {
+      "command_id": "macos.ir",
+      "cli_path": [
+        "macos.ir"
+      ],
+      "aliases": [],
+      "help": "根据显式 macOS 符号与驻留内核链分析系统、进程和文件（OS X 10.8–10.11，x86-64）。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "module",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "name",
+          "value_type": "string",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "kernel",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "auxiliary_file",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:macos.ir",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "macos.ir"
+    },
+    "macos.dumpfile": {
+      "command_id": "macos.dumpfile",
+      "cli_path": [
+        "macos.dumpfile"
+      ],
+      "aliases": [],
+      "help": "按 vnode/UBC/vm_object 归属恢复 macOS 驻留文件页；缺页使用 .partial 产物。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "address",
+          "value_type": "address",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "output",
+          "value_type": "output_path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "max-size",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "file_system",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "auxiliary_file",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        },
+        {
+          "name": "recovered_file",
+          "kind": "file",
+          "media_type": "application/octet-stream",
+          "required": true
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "recovery_manifest",
+          "kind": "file",
+          "media_type": "application/json",
+          "required": true
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:macos.dumpfile",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "macos.dumpfile"
+    },
+    "symbolless.registry": {
+      "command_id": "symbolless.registry",
+      "cli_path": [
+        "symbolless.registry"
+      ],
+      "aliases": [],
+      "help": "从显式选择的 Hive 文件对象解析注册表与离线凭据；仅手动执行。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "address",
+          "value_type": "address",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "expected-physical",
+          "value_type": "address",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "source",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "action",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-address",
+          "value_type": "address",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-physical",
+          "value_type": "address",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-source",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "key",
+          "value_type": "string",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "recurse",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-size",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.registry",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.registry"
+    },
+    "symbolless.process-modules": {
+      "command_id": "symbolless.process-modules",
+      "cli_path": [
+        "symbolless.process-modules"
+      ],
+      "aliases": [],
+      "help": "无符号进程 DLL：逐进程恢复原生 AMD64 加载器模块链，保留缺页和核验状态。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "module-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.process-modules",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.process-modules"
+    },
+    "symbolless.process-context": {
+      "command_id": "symbolless.process-context",
+      "cli_path": [
+        "symbolless.process-context"
+      ],
+      "aliases": [],
+      "help": "无符号进程上下文：恢复原生 AMD64 命令行、映像路径及环境变量。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "environment-bytes",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.process-context",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.process-context"
+    },
+    "symbolless.system-info": {
+      "command_id": "symbolless.system-info",
+      "cli_path": [
+        "symbolless.system-info"
+      ],
+      "aliases": [],
+      "help": "无外部调试符号的基础系统信息；字段保留来源、缺失及估算说明。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.system-info",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.system-info"
+    },
+    "symbolless.pslist": {
+      "command_id": "symbolless.pslist",
+      "cli_path": [
+        "symbolless.pslist"
+      ],
+      "aliases": [],
+      "help": "无外部调试符号的基础进程分析（实验性，仅手动执行）。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.pslist",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.pslist"
+    },
+    "symbolless.filescan": {
+      "command_id": "symbolless.filescan",
+      "cli_path": [
+        "symbolless.filescan"
+      ],
+      "aliases": [],
+      "help": "无外部调试符号的文件对象扫描（实验性，仅手动执行）。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "name",
+          "value_type": "string",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [],
+      "evidence_defaults": {
+        "scope": "command:symbolless.filescan",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.filescan"
+    },
+    "symbolless.dumpfile": {
+      "command_id": "symbolless.dumpfile",
+      "cli_path": [
+        "symbolless.dumpfile"
+      ],
+      "aliases": [],
+      "help": "从已核验的无符号 FILE_OBJECT 恢复驻留内容并保存范围说明。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "address",
+          "value_type": "address",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "expected-physical",
+          "value_type": "address",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "output",
+          "value_type": "output_path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "source",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-size",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        },
+        {
+          "name": "recovered_file",
+          "kind": "file",
+          "media_type": "application/octet-stream",
+          "required": true
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "recovery_manifest",
+          "kind": "file",
+          "media_type": "application/json",
+          "required": true
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:symbolless.dumpfile",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "symbolless.dumpfile"
+    },
+    "browser-pages": {
+      "command_id": "browser-pages",
+      "cli_path": [
+        "browser-pages"
+      ],
+      "aliases": [],
+      "help": "关联浏览器窗口、驻留 URL 与 Session 片段，保留页面和标签页线索的来源。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-process-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "browser",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:browser-pages",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "browser-pages"
+    },
+    "windows.interaction": {
+      "command_id": "windows.interaction",
+      "cli_path": [
+        "windows.interaction"
+      ],
+      "aliases": [],
+      "help": "分析前台焦点、编辑控件、输入法、剪贴板、浏览器会话、Explorer 与通知痕迹。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "timeline",
+      "input_roles": [
+        {
+          "role": "auxiliary_file",
+          "required": false
+        },
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:windows.interaction",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": false,
+      "equivalence_id": "windows.interaction"
+    },
     "accountscan": {
       "command_id": "accountscan",
       "cli_path": [
@@ -24,6 +1001,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -124,6 +1107,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -247,6 +1236,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -344,6 +1339,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -473,6 +1474,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -564,7 +1571,7 @@
         "browser-history"
       ],
       "aliases": [],
-      "help": "从 Chromium History 数据库恢复 URL 访问历史。",
+      "help": "从 Chromium History 与 Firefox places.sqlite 恢复 URL 概要及逐次访问事件。",
       "arguments": [
         {
           "name": "image",
@@ -580,6 +1587,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -718,7 +1731,7 @@
         "browser-session"
       ],
       "aliases": [],
-      "help": "聚合浏览器进程、Cookie、下载、History 与 Login Data，重建可验证的浏览器会话证据。",
+      "help": "聚合浏览器进程、Cookie、Chromium/Firefox 历史、下载与账号元数据，重建可验证的会话证据。",
       "arguments": [
         {
           "name": "image",
@@ -734,6 +1747,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -926,6 +1945,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -1021,6 +2046,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -1123,6 +2154,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -1231,7 +2268,7 @@
         "clipboardscan"
       ],
       "aliases": [],
-      "help": "解析 Window Station、格式数组、句柄和数据块，恢复活动剪切板内容。",
+      "help": "恢复活动剪贴板格式及经符号布局验证的 TextInputHost 驻留历史。",
       "arguments": [
         {
           "name": "image",
@@ -1247,6 +2284,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -1358,6 +2401,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -1453,6 +2502,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -1564,6 +2619,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -1665,6 +2726,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -1818,6 +2885,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -1913,6 +2986,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -2097,6 +3176,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -2197,6 +3282,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -2292,6 +3383,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -2433,6 +3530,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -2533,6 +3636,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -2628,6 +3737,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -2739,6 +3854,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -2834,6 +3955,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -3048,6 +4175,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -3160,6 +4293,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -3255,6 +4394,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -3360,6 +4505,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -3455,6 +4606,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -3579,6 +4736,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -3732,6 +4895,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -3870,6 +5039,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -3970,6 +5145,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -4065,6 +5246,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -4245,6 +5432,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -4340,6 +5533,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -4481,6 +5680,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -4581,6 +5786,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -4676,6 +5887,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -4782,6 +5999,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -4899,6 +6122,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5011,6 +6240,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5106,6 +6341,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -5211,6 +6452,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5306,6 +6553,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -5417,6 +6670,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5512,6 +6771,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -5679,6 +6944,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5796,6 +7067,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -5891,6 +7168,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -6002,6 +7285,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6089,6 +7378,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -6202,6 +7497,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6312,6 +7613,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6407,6 +7714,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -6565,6 +7878,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6663,6 +7982,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6740,6 +8065,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -6847,6 +8178,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -6945,6 +8282,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -7040,6 +8383,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -7177,6 +8526,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -7272,6 +8627,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -7391,6 +8752,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -7480,6 +8847,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -7611,6 +8984,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -7692,6 +9071,152 @@
       "collect_parameterized": false,
       "equivalence_id": "linux.proc.maps"
     },
+    "linux.proc.strings": {
+      "command_id": "linux.proc.strings",
+      "cli_path": [
+        "linux.proc.strings"
+      ],
+      "aliases": [
+        "linux-proc-strings"
+      ],
+      "help": "提取 Linux 进程堆、栈及可选匿名可写映射中驻留页面的 UTF-8/UTF-16LE 字符串，并给出虚拟地址。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "map-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "region",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "min-length",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "encoding",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "grep",
+          "value_type": "string",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-string-chars",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-region-size",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "linux",
+      "input_roles": [
+        {
+          "role": "auxiliary_file",
+          "required": false
+        },
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:linux.proc.strings",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": false,
+      "equivalence_id": "linux.proc.strings"
+    },
     "linux.psaux": {
       "command_id": "linux.psaux",
       "cli_path": [
@@ -7706,6 +9231,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -7807,6 +9338,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -7896,6 +9433,12 @@
           "name": "image",
           "value_type": "path",
           "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
           "repeatable": false
         },
         {
@@ -8009,6 +9552,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -8115,6 +9664,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -8216,6 +9771,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -8383,6 +9944,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -8762,6 +10329,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -8857,6 +10430,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -8962,6 +10541,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -9057,6 +10642,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -9162,6 +10753,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -9259,6 +10856,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -9400,6 +11003,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -9524,6 +11133,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -9619,6 +11234,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -9727,6 +11348,272 @@
       "collect_parameterized": true,
       "equivalence_id": "pedump"
     },
+    "mouse-history": {
+      "command_id": "mouse-history",
+      "cli_path": [
+        "mouse-history"
+      ],
+      "aliases": [],
+      "help": "按会话恢复最近最多 64 个鼠标位置，保留环内顺序、时钟限制和原始地址。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "auxiliary_file",
+          "required": false
+        },
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:mouse-history",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "runnable",
+      "collect_parameterized": false,
+      "equivalence_id": "mouse-history"
+    },
+    "mailslots": {
+      "command_id": "mailslots",
+      "cli_path": [
+        "mailslots"
+      ],
+      "aliases": [],
+      "help": "验证 MSFS mailslot 端点、关联进程句柄，并恢复支持布局的队列消息。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "handle-scan-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "message-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-message-bytes",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-total-message-bytes",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "output",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "file_system",
+      "input_roles": [
+        {
+          "role": "auxiliary_file",
+          "required": false
+        },
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        },
+        {
+          "name": "export_directory",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        },
+        {
+          "name": "owned_export_files",
+          "kind": "file",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:mailslots",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "runnable",
+      "collect_parameterized": false,
+      "equivalence_id": "mailslots"
+    },
     "pipescan": {
       "command_id": "pipescan",
       "cli_path": [
@@ -9749,6 +11636,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -9872,6 +11765,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -9973,6 +11872,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -10102,6 +12007,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -10202,6 +12113,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -10281,7 +12198,7 @@
         "profile"
       ],
       "aliases": [],
-      "help": "从内核 PDB 生成精简的 _EPROCESS 字段配置。",
+      "help": "从内核 PDB 生成精简符号配置；.ssym 输出为实验性二进制，其余为 JSON。",
       "arguments": [
         {
           "name": "pdb",
@@ -10360,6 +12277,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -10465,6 +12388,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -10565,6 +12494,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -10660,6 +12595,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -10783,6 +12724,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -10878,6 +12825,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -10999,6 +12952,18 @@
           "repeatable": false
         },
         {
+          "name": "encoding",
+          "value_type": "choice",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "context-bytes",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "limit",
           "value_type": "integer",
           "required": false,
@@ -11077,6 +13042,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -11182,6 +13153,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -11277,6 +13254,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -11382,6 +13365,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -11482,6 +13471,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -11577,6 +13572,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -11736,6 +13737,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -11831,6 +13838,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -11948,6 +13961,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -12043,6 +14062,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -12148,6 +14173,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -12243,6 +14274,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -12354,6 +14391,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -12460,6 +14503,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -12557,6 +14606,12 @@
         {
           "name": "name",
           "value_type": "string",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
           "required": false,
           "repeatable": false
         },
@@ -12738,6 +14793,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -12829,6 +14890,12 @@
         {
           "name": "fetch",
           "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
           "required": false,
           "repeatable": false
         },
@@ -12991,6 +15058,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13091,6 +15164,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13186,6 +15265,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -13315,6 +15400,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13433,6 +15524,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13528,6 +15625,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -13633,6 +15736,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13730,6 +15839,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -13853,6 +15968,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -13953,6 +16074,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -14048,6 +16175,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -14183,6 +16316,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -14284,6 +16423,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -14391,6 +16536,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -14537,6 +16688,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -14660,6 +16817,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -14848,6 +17011,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -14943,6 +17112,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -15084,6 +17259,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -15175,6 +17356,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -15390,6 +17577,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -15535,6 +17728,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -15688,6 +17887,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -15815,6 +18020,12 @@
         },
         {
           "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
           "value_type": "path",
           "required": false,
           "repeatable": false
@@ -15986,6 +18197,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -16086,6 +18303,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -16176,6 +18399,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -16189,7 +18418,7 @@
         },
         {
           "name": "module",
-          "value_type": "string",
+          "value_type": "choice",
           "required": false,
           "repeatable": false
         },
@@ -16286,6 +18515,12 @@
           "repeatable": false
         },
         {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
           "name": "cache",
           "value_type": "output_path",
           "required": false,
@@ -16311,7 +18546,7 @@
         },
         {
           "name": "module",
-          "value_type": "string",
+          "value_type": "choice",
           "required": false,
           "repeatable": false
         },
@@ -16390,6 +18625,1372 @@
       "collect_disposition": "skipped",
       "collect_parameterized": false,
       "equivalence_id": "linux.ir-kernel"
+    },
+    "wechat-chat": {
+      "command_id": "wechat-chat",
+      "cli_path": [
+        "wechat-chat"
+      ],
+      "aliases": [],
+      "help": "从微信驻留 WCDB 缓存恢复聊天正文、发送者、联系人和会话摘要。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-space-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache-page-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "process",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:wechat-chat",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "wechat-chat"
+    },
+    "qqscan": {
+      "command_id": "qqscan",
+      "cli_path": [
+        "qqscan"
+      ],
+      "aliases": [],
+      "help": "恢复 QQNT 进程中的消息片段、联系人资料、附件传输和客户端日志。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-space-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "process",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:qqscan",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "qqscan"
+    },
+    "bitlocker": {
+      "command_id": "bitlocker",
+      "cli_path": [
+        "bitlocker"
+      ],
+      "aliases": [],
+      "help": "检测 BitLocker 组件、恢复密钥文件线索与驻留文本，不推定卷状态。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:bitlocker",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "bitlocker"
+    },
+    "veracrypt": {
+      "command_id": "veracrypt",
+      "cli_path": [
+        "veracrypt"
+      ],
+      "aliases": [],
+      "help": "检测 VeraCrypt 进程、驱动、容器候选与挂载历史配置。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:veracrypt",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "veracrypt"
+    },
+    "sunlogin": {
+      "command_id": "sunlogin",
+      "cli_path": [
+        "sunlogin"
+      ],
+      "aliases": [],
+      "help": "分析向日葵/AweSun 进程、网络及驻留配置与日志。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:sunlogin",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "sunlogin"
+    },
+    "anydesk": {
+      "command_id": "anydesk",
+      "cli_path": [
+        "anydesk"
+      ],
+      "aliases": [],
+      "help": "分析 AnyDesk 进程、网络、本机标识及连接请求日志。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:anydesk",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "anydesk"
+    },
+    "wps": {
+      "command_id": "wps",
+      "cli_path": [
+        "wps"
+      ],
+      "aliases": [],
+      "help": "分析 WPS 进程、网络、最近文档及驻留配置与日志。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:wps",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "wps"
+    },
+    "huorong": {
+      "command_id": "huorong",
+      "cli_path": [
+        "huorong"
+      ],
+      "aliases": [],
+      "help": "火绒报毒、隔离与驻留日志分析。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:huorong",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "huorong"
+    },
+    "ai-chat": {
+      "command_id": "ai-chat",
+      "cli_path": [
+        "ai-chat"
+      ],
+      "aliases": [],
+      "help": "AI 客户端本地会话与进程内存分析。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "file-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-files",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "max-file-mib",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pid",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "skip-memory",
+          "value_type": "boolean",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "anchor-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "process-limit",
+          "value_type": "integer",
+          "required": false,
+          "repeatable": false
+        }
+      ],
+      "category": "windows",
+      "input_roles": [
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:ai-chat",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "ai-chat"
+    },
+    "windows.phys2file": {
+      "command_id": "windows.phys2file",
+      "cli_path": [
+        "windows.phys2file"
+      ],
+      "aliases": [],
+      "help": "从指定物理字节的 PFN 和原型 PTE 反查数据节文件对象与文件内偏移。",
+      "arguments": [
+        {
+          "name": "image",
+          "value_type": "path",
+          "required": true,
+          "repeatable": false
+        },
+        {
+          "name": "profile",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "pdb",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "system-map",
+          "value_type": "path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "cache",
+          "value_type": "output_path",
+          "required": false,
+          "repeatable": false
+        },
+        {
+          "name": "symbol-path",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "physical",
+          "value_type": "address",
+          "required": true,
+          "repeatable": false
+        }
+      ],
+      "category": "file_system",
+      "input_roles": [
+        {
+          "role": "auxiliary_file",
+          "required": false
+        },
+        {
+          "role": "memory_image",
+          "required": true
+        },
+        {
+          "role": "pdb",
+          "required": false
+        },
+        {
+          "role": "symbol_store",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "evidence_report",
+          "kind": "structured_report",
+          "media_type": "application/json",
+          "required": true
+        },
+        {
+          "name": "csv_report",
+          "kind": "file",
+          "media_type": "text/csv",
+          "required": false
+        },
+        {
+          "name": "raw_objects",
+          "kind": "file",
+          "media_type": "application/x-ndjson",
+          "required": false
+        }
+      ],
+      "derived_outputs": [
+        {
+          "name": "symbol_cache",
+          "kind": "directory",
+          "media_type": null,
+          "required": false
+        }
+      ],
+      "evidence_defaults": {
+        "scope": "command:windows.phys2file",
+        "adapter": "native-evidence-envelope-v1"
+      },
+      "collect_disposition": "skipped",
+      "collect_parameterized": true,
+      "equivalence_id": "windows.phys2file"
     }
   }
 }

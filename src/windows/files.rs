@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Cursor, Error, ErrorKind, Seek, SeekFrom, Write};
 use std::time::Instant;
@@ -7,15 +7,18 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use super::WindowsKernelContext;
-use crate::address::X64AddressSpace;
+use crate::address::WindowsAddressSpace;
 use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 use crate::scan::scan_exact_4_cancellable;
 
+mod mapping;
+pub use mapping::{FileMemoryMap, map_file_memory};
+mod pfn;
+pub use pfn::{PhysicalFileRecord, PhysicalFileReport, locate_physical_file};
+
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
-const POOL_GRANULARITY: u64 = 16;
-const POOL_HEADER_SIZE: u64 = 16;
 
 #[derive(Debug, Serialize)]
 pub struct FileScanRecord {
@@ -138,6 +141,8 @@ pub struct DumpFileReport {
     pub missing_bytes: u64,
     pub complete: bool,
     pub extents: Vec<RecoveredExtent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compressed_pages: Vec<super::compressed_store::CompressedPageEvidence>,
     pub warnings: Vec<String>,
 }
 
@@ -150,6 +155,7 @@ struct PhysicalFileCandidate {
 }
 
 struct PhysicalSignatureLayout {
+    pointer_size: u64,
     expected_size: u64,
     type_offset: u64,
     size_offset: u64,
@@ -161,9 +167,14 @@ struct PhysicalSignatureLayout {
 struct ObjectTypeDecoder {
     cookie: Option<u8>,
     type_table: Option<u64>,
-    type_index_offset: u64,
+    type_location: ObjectTypeLocation,
     body_offset: u64,
     type_name_offset: u64,
+}
+
+enum ObjectTypeLocation {
+    Index(u64),
+    Pointer(u64),
 }
 
 pub fn scan_files(
@@ -192,6 +203,26 @@ pub fn scan_files_matching(
     limit: usize,
     name_filter: &dyn Fn(&str) -> bool,
 ) -> Result<FileScanReport> {
+    scan_files_matching_cancellable(
+        image,
+        kernel,
+        profile,
+        limit,
+        name_filter,
+        &CancellationToken::new(),
+    )
+}
+
+/// Apply the path predicate before the result cap and kernel reverse mapping,
+/// while keeping cancellation attached to the caller's task.
+pub fn scan_files_matching_cancellable(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    limit: usize,
+    name_filter: &dyn Fn(&str) -> bool,
+    cancellation: &CancellationToken,
+) -> Result<FileScanReport> {
     scan_files_impl(
         image,
         kernel,
@@ -199,7 +230,7 @@ pub fn scan_files_matching(
         limit,
         Some(name_filter),
         None,
-        &CancellationToken::new(),
+        cancellation,
     )
 }
 
@@ -235,7 +266,9 @@ fn scan_files_impl(
     let total_started = Instant::now();
     cancellation.check_cancelled()?;
     ensure!(limit > 0, "文件结果数量上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.address_space(image)?;
+    let pool_granularity = space.pointer_size() * 2;
+    let pool_header_size = pool_granularity;
     let file_layout = profile.type_layout("_FILE_OBJECT")?;
     let file_size = file_layout.size;
     let file_type_offset = profile.type_field("_FILE_OBJECT", "Type")?.offset;
@@ -258,6 +291,7 @@ fn scan_files_impl(
         .offset;
     let object_decoder = ObjectTypeDecoder::new(&space, kernel, profile)?;
     let signature_layout = PhysicalSignatureLayout {
+        pointer_size: space.pointer_size(),
         expected_size: file_size,
         type_offset: file_type_offset,
         size_offset: file_size_offset,
@@ -296,26 +330,28 @@ fn scan_files_impl(
     let mut physical_candidates = Vec::new();
     for hit in pool_hits {
         cancellation.check_cancelled()?;
-        if hit & 0xf != 4 {
+        if hit & (pool_granularity - 1) != 4 {
             continue;
         }
         let Some(pool_header) = hit.checked_sub(4) else {
             continue;
         };
-        let mut header = [0u8; POOL_HEADER_SIZE as usize];
-        if image.read_physical(pool_header, &mut header).is_err()
+        let mut header = [0u8; 16];
+        if image
+            .read_physical(pool_header, &mut header[..pool_header_size as usize])
+            .is_err()
             || &header[4..7] != b"Fil"
             || header[7] & 0x7f != b'e'
         {
             continue;
         }
-        let pool_size = u64::from(header[2]) * POOL_GRANULARITY;
-        let aligned_file_size = file_size.next_multiple_of(POOL_GRANULARITY);
-        if pool_size < POOL_HEADER_SIZE + object_decoder.body_offset + aligned_file_size {
+        let pool_size = u64::from(header[2]) * pool_granularity;
+        let aligned_file_size = file_size.next_multiple_of(pool_granularity);
+        if pool_size < pool_header_size + object_decoder.body_offset + aligned_file_size {
             continue;
         }
         let Some(first_body) = pool_header
-            .checked_add(POOL_HEADER_SIZE)
+            .checked_add(pool_header_size)
             .and_then(|start| start.checked_add(object_decoder.body_offset))
         else {
             continue;
@@ -337,11 +373,11 @@ fn scan_files_impl(
                         file_object + name_offset,
                         32 * 1024,
                     ) else {
-                        file_object += POOL_GRANULARITY;
+                        file_object += pool_granularity;
                         continue;
                     };
                     if !filter(&name) {
-                        file_object += POOL_GRANULARITY;
+                        file_object += pool_granularity;
                         continue;
                     }
                     Some(name)
@@ -355,7 +391,7 @@ fn scan_files_impl(
                     prefetched_name,
                 });
             }
-            file_object += POOL_GRANULARITY;
+            file_object += pool_granularity;
         }
     }
     let candidate_filter_seconds = candidate_filter_started.elapsed().as_secs_f64();
@@ -404,10 +440,12 @@ fn scan_files_impl(
             if object_type.as_deref().is_some_and(|name| name != "File") {
                 continue;
             }
-            let device_object = space.read_u64(file_object + device_offset).unwrap_or(0);
-            let section_object_pointer = space.read_u64(file_object + section_offset).unwrap_or(0);
-            if !is_null_or_kernel_pointer(device_object)
-                || !is_null_or_kernel_pointer(section_object_pointer)
+            let device_object = space.read_pointer(file_object + device_offset).unwrap_or(0);
+            let section_object_pointer = space
+                .read_pointer(file_object + section_offset)
+                .unwrap_or(0);
+            if !is_null_or_kernel_pointer(device_object, space.pointer_size())
+                || !is_null_or_kernel_pointer(section_object_pointer, space.pointer_size())
             {
                 continue;
             }
@@ -425,7 +463,7 @@ fn scan_files_impl(
                 && (name
                     .as_deref()
                     .is_none_or(|value| !validate_unverified_file_object_name(value))
-                    || !is_kernel_pointer(device_object))
+                    || !is_kernel_pointer_for(&space, device_object))
             {
                 continue;
             }
@@ -487,11 +525,11 @@ fn scan_files_impl(
     })
 }
 
-fn section_field(space: &X64AddressSpace<'_>, section: u64, offset: u64) -> u64 {
-    if !is_kernel_pointer(section) {
+fn section_field(space: &WindowsAddressSpace<'_>, section: u64, offset: u64) -> u64 {
+    if !is_kernel_pointer_for(space, section) {
         return 0;
     }
-    space.read_u64(section + offset).unwrap_or(0) & !0xf
+    space.read_pointer(section + offset).unwrap_or(0) & !(space.pointer_size() * 2 - 1)
 }
 
 pub fn dump_file(
@@ -539,6 +577,38 @@ pub fn recover_file_bytes(
 
 trait RecoverySink: Write + Seek {
     fn resize(&mut self, length: u64) -> std::io::Result<()>;
+
+    fn copy_virtual_page(
+        &mut self,
+        space: &WindowsAddressSpace<'_>,
+        memory: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<bool> {
+        let mut page = vec![0u8; length];
+        if space.read_virtual(memory, &mut page).is_err() {
+            return Ok(false);
+        }
+        self.seek(SeekFrom::Start(offset))?;
+        self.write_all(&page)?;
+        Ok(true)
+    }
+
+    fn copy_physical_page(
+        &mut self,
+        image: &MemoryImage,
+        memory: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<bool> {
+        let mut page = vec![0u8; length];
+        if image.read_physical(memory, &mut page).is_err() {
+            return Ok(false);
+        }
+        self.seek(SeekFrom::Start(offset))?;
+        self.write_all(&page)?;
+        Ok(true)
+    }
 }
 
 impl RecoverySink for File {
@@ -569,7 +639,7 @@ fn dump_file_to_sink<O: RecoverySink>(
     max_size: u64,
 ) -> Result<DumpFileReport> {
     ensure!(max_size > 0, "最大恢复大小必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.address_space(image)?;
     let file_size = profile.type_layout("_FILE_OBJECT")?.size;
     let type_offset = profile.type_field("_FILE_OBJECT", "Type")?.offset;
     let size_offset = profile.type_field("_FILE_OBJECT", "Size")?.offset;
@@ -593,9 +663,9 @@ fn dump_file_to_sink<O: RecoverySink>(
     let section_pointer_offset = profile
         .type_field("_FILE_OBJECT", "SectionObjectPointer")?
         .offset;
-    let section_object_pointers = space.read_u64(file_object + section_pointer_offset)?;
+    let section_object_pointers = space.read_pointer(file_object + section_pointer_offset)?;
     ensure!(
-        is_kernel_pointer(section_object_pointers),
+        is_kernel_pointer_for(&space, section_object_pointers),
         "FILE_OBJECT 没有有效的 SectionObjectPointer"
     );
     let data_offset = profile
@@ -608,22 +678,22 @@ fn dump_file_to_sink<O: RecoverySink>(
         .type_field("_SECTION_OBJECT_POINTERS", "ImageSectionObject")?
         .offset;
     let shared_cache_map = space
-        .read_u64(section_object_pointers + cache_offset)
+        .read_pointer(section_object_pointers + cache_offset)
         .unwrap_or(0)
-        & !0xf;
+        & !(space.pointer_size() * 2 - 1);
     let data_control_area = space
-        .read_u64(section_object_pointers + data_offset)
+        .read_pointer(section_object_pointers + data_offset)
         .unwrap_or(0)
-        & !0xf;
+        & !(space.pointer_size() * 2 - 1);
     let image_control_area = space
-        .read_u64(section_object_pointers + image_offset)
+        .read_pointer(section_object_pointers + image_offset)
         .unwrap_or(0)
-        & !0xf;
+        & !(space.pointer_size() * 2 - 1);
 
     let sources: &[DumpSource] = match requested_source {
         // Cache and data-section views preserve on-disk byte offsets.  Image
-        // sections are a last resort because PE mappings may differ from the
-        // original file layout.
+        // sections are only used when neither file-layout source has readable
+        // bytes, because resident PE pages may contain loader/runtime changes.
         DumpSource::Auto => &[DumpSource::Cache, DumpSource::Data, DumpSource::Image],
         DumpSource::Cache => &[DumpSource::Cache],
         DumpSource::Data => &[DumpSource::Data],
@@ -635,11 +705,8 @@ fn dump_file_to_sink<O: RecoverySink>(
     let logical_hint = cache_file_size(&space, profile, shared_cache_map, max_size)
         .ok()
         .or_else(|| file_object_size(&space, profile, file_object, max_size).ok());
-    let mut last_report = None;
-    for source in sources {
-        output.resize(0)?;
-        output.seek(SeekFrom::Start(0))?;
-        let result = match source {
+    let recover_source = |source, output: &mut O| -> Result<DumpFileReport> {
+        match source {
             DumpSource::Cache => {
                 dump_cache_map(&space, profile, shared_cache_map, output, max_size)
             }
@@ -667,12 +734,34 @@ fn dump_file_to_sink<O: RecoverySink>(
                 unreachable!("hive-memory recovery is not a FILE_OBJECT source")
             }
             DumpSource::Auto => unreachable!(),
-        };
+        }
+    };
+    let mut last_report = None;
+    let mut best_report: Option<DumpFileReport> = None;
+    let mut last_source = None;
+    for &source in sources {
+        if source == DumpSource::Image && best_report.is_some() {
+            break;
+        }
+        output.resize(0)?;
+        output.seek(SeekFrom::Start(0))?;
+        let result = recover_source(source, output);
+        last_source = Some(source);
         match result {
             Ok(mut report) if report.recovered_bytes > 0 => {
                 report.file_object = file_object;
-                report.name = name;
-                return Ok(report);
+                report.name = name.clone();
+                if report.complete {
+                    return Ok(report);
+                }
+                // A readable cache tail is not enough: the data section may
+                // still contain the header and every missing cache page.
+                if best_report
+                    .as_ref()
+                    .is_none_or(|best| report.recovered_bytes > best.recovered_bytes)
+                {
+                    best_report = Some(report);
+                }
             }
             Ok(mut report) => {
                 report.file_object = file_object;
@@ -683,17 +772,32 @@ fn dump_file_to_sink<O: RecoverySink>(
                 last_report = Some(DumpFileReport {
                     file_object,
                     name: name.clone(),
-                    source: *source,
+                    source,
                     logical_size: 0,
                     output_size: 0,
                     recovered_bytes: 0,
                     missing_bytes: 0,
                     complete: false,
                     extents: Vec::new(),
+                    compressed_pages: Vec::new(),
                     warnings: vec![format!("{source:?} 恢复失败：{error:#}")],
                 });
             }
         }
+    }
+    if let Some(report) = best_report {
+        if last_source == Some(report.source) {
+            return Ok(report);
+        }
+        // Later attempts reused the sink. Replay only the selected source so
+        // sparse tails are truncated and bytes from different views never mix.
+        // This keeps large file recovery streaming instead of buffering copies.
+        output.resize(0)?;
+        output.seek(SeekFrom::Start(0))?;
+        let mut report = recover_source(report.source, output)?;
+        report.file_object = file_object;
+        report.name = name;
+        return Ok(report);
     }
     Ok(last_report.unwrap_or(DumpFileReport {
         file_object,
@@ -705,19 +809,20 @@ fn dump_file_to_sink<O: RecoverySink>(
         missing_bytes: 0,
         complete: false,
         extents: Vec::new(),
+        compressed_pages: Vec::new(),
         warnings: vec!["没有可用的恢复来源".to_owned()],
     }))
 }
 
 fn dump_cache_map<O: RecoverySink>(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     profile: &KernelProfile,
     shared_cache_map: u64,
     output: &mut O,
     max_size: u64,
 ) -> Result<DumpFileReport> {
     ensure!(
-        is_kernel_pointer(shared_cache_map),
+        is_kernel_pointer_for(space, shared_cache_map),
         "SharedCacheMap 为空或无效"
     );
     let logical_size = cache_file_size(space, profile, shared_cache_map, max_size)?;
@@ -727,22 +832,26 @@ fn dump_cache_map<O: RecoverySink>(
     let vacb_map = profile.type_field("_VACB", "SharedCacheMap")?.offset;
     let vacb_overlay = profile.type_field("_VACB", "Overlay")?.offset;
     let mut vacb_pointers = Vec::new();
-    let initial_count = initial.size.unwrap_or(32).div_ceil(8).clamp(1, 16);
+    let initial_count = initial
+        .size
+        .unwrap_or(space.pointer_size() * 4)
+        .div_ceil(space.pointer_size())
+        .clamp(1, 16);
     for index in 0..initial_count {
         let Some(address) = shared_cache_map
             .checked_add(initial.offset)
-            .and_then(|address| address.checked_add(index * 8))
+            .and_then(|address| address.checked_add(index * space.pointer_size()))
         else {
             continue;
         };
-        if let Ok(pointer) = space.read_u64(address) {
+        if let Ok(pointer) = space.read_pointer(address) {
             vacb_pointers.push(pointer & !0x7);
         }
     }
     let initial_array = shared_cache_map.checked_add(initial.offset);
     if let Some(address) = shared_cache_map.checked_add(vacbs_offset)
-        && let Ok(root) = space.read_u64(address)
-        && is_kernel_pointer(root & !0x7)
+        && let Ok(root) = space.read_pointer(address)
+        && is_kernel_pointer_for(space, root & !0x7)
         // Small files point Vacbs back to the inline four-slot array. Walking
         // 128 entries from there spills into unrelated SHARED_CACHE_MAP fields
         // and can make SECTION_OBJECT_POINTERS look like a VACB by accident.
@@ -765,19 +874,19 @@ fn dump_cache_map<O: RecoverySink>(
     for vacb in vacb_pointers {
         let base = vacb
             .checked_add(vacb_base)
-            .and_then(|address| space.read_u64(address).ok())
+            .and_then(|address| space.read_pointer(address).ok())
             .unwrap_or(0);
         let owner = vacb
             .checked_add(vacb_map)
-            .and_then(|address| space.read_u64(address).ok())
+            .and_then(|address| space.read_pointer(address).ok())
             .unwrap_or(0)
-            & !0xf;
+            & !(space.pointer_size() * 2 - 1);
         let file_offset = vacb
             .checked_add(vacb_overlay)
             .and_then(|address| space.read_u64(address).ok())
             .unwrap_or(u64::MAX);
         if owner == shared_cache_map
-            && is_kernel_pointer(base)
+            && is_kernel_pointer_for(space, base)
             // System-cache views are page aligned. This also rejects a false
             // VACB whose "BaseAddress" is actually a CONTROL_AREA pointer.
             && base.is_multiple_of(0x1000)
@@ -800,15 +909,12 @@ fn dump_cache_map<O: RecoverySink>(
                 continue;
             }
             let length = (view_length - relative).min(0x1000) as usize;
-            let mut page = vec![0u8; length];
             let Some(memory) = base.checked_add(relative) else {
                 continue;
             };
-            if space.read_virtual(memory, &mut page).is_err() {
+            if !output.copy_virtual_page(space, memory, file_offset, length)? {
                 continue;
             }
-            output.seek(SeekFrom::Start(file_offset))?;
-            output.write_all(&page)?;
             recovered_bytes += length as u64;
             push_extent(&mut extents, file_offset, length as u64, memory, "virtual");
         }
@@ -824,13 +930,13 @@ fn dump_cache_map<O: RecoverySink>(
 }
 
 fn cache_file_size(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     profile: &KernelProfile,
     shared_cache_map: u64,
     max_size: u64,
 ) -> Result<u64> {
     ensure!(
-        is_kernel_pointer(shared_cache_map),
+        is_kernel_pointer_for(space, shared_cache_map),
         "SharedCacheMap 为空或无效"
     );
     let offset = profile.type_field("_SHARED_CACHE_MAP", "FileSize")?.offset;
@@ -847,19 +953,19 @@ fn cache_file_size(
 }
 
 fn file_object_size(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     profile: &KernelProfile,
     file_object: u64,
     max_size: u64,
 ) -> Result<u64> {
     let fs_context_offset = profile.type_field("_FILE_OBJECT", "FsContext")?.offset;
-    let fs_context = space.read_u64(
+    let fs_context = space.read_pointer(
         file_object
             .checked_add(fs_context_offset)
             .context("FILE_OBJECT FsContext 字段地址溢出")?,
     )?;
     ensure!(
-        is_kernel_pointer(fs_context),
+        is_kernel_pointer_for(space, fs_context),
         "FILE_OBJECT 没有有效的 FsContext"
     );
 
@@ -898,7 +1004,7 @@ fn file_object_size(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_vacb_tree(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     root: u64,
     shared_cache_map: u64,
     vacb_map_offset: u64,
@@ -915,18 +1021,18 @@ fn collect_vacb_tree(
         }
         for index in 0..128u64 {
             let pointer = array
-                .checked_add(index * 8)
-                .and_then(|address| space.read_u64(address).ok())
+                .checked_add(index * space.pointer_size())
+                .and_then(|address| space.read_pointer(address).ok())
                 .unwrap_or(0)
                 & !0x7;
-            if !is_kernel_pointer(pointer) {
+            if !is_kernel_pointer_for(space, pointer) {
                 continue;
             }
             let owner = pointer
                 .checked_add(vacb_map_offset)
-                .and_then(|address| space.read_u64(address).ok())
+                .and_then(|address| space.read_pointer(address).ok())
                 .unwrap_or(0)
-                & !0xf;
+                & !(space.pointer_size() * 2 - 1);
             let file_offset = space
                 .read_u64(match pointer.checked_add(vacb_overlay_offset) {
                     Some(address) => address,
@@ -948,7 +1054,7 @@ fn collect_vacb_tree(
 #[allow(clippy::too_many_arguments)]
 fn dump_control_area<O: RecoverySink>(
     image: &MemoryImage,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     profile: &KernelProfile,
     control_area: u64,
     logical_hint: Option<u64>,
@@ -956,20 +1062,23 @@ fn dump_control_area<O: RecoverySink>(
     max_size: u64,
     source: DumpSource,
 ) -> Result<DumpFileReport> {
-    ensure!(is_kernel_pointer(control_area), "控制区为空或无效");
+    ensure!(
+        is_kernel_pointer_for(space, control_area),
+        "控制区为空或无效"
+    );
     let segment_offset = profile.type_field("_CONTROL_AREA", "Segment")?.offset;
     let segment_address = control_area
         .checked_add(segment_offset)
         .context("控制区字段地址溢出")?;
-    let segment = space.read_u64(segment_address)? & !0xf;
-    ensure!(is_kernel_pointer(segment), "控制区没有有效的段");
+    let segment = space.read_pointer(segment_address)? & !(space.pointer_size() * 2 - 1);
+    ensure!(is_kernel_pointer_for(space, segment), "控制区没有有效的段");
     let segment_control = profile.type_field("_SEGMENT", "ControlArea")?.offset;
     ensure!(
-        space.read_u64(
+        space.read_pointer(
             segment
                 .checked_add(segment_control)
                 .context("段控制区字段地址溢出")?,
-        )? & !0xf
+        )? & !(space.pointer_size() * 2 - 1)
             == control_area,
         "段没有引用所选控制区"
     );
@@ -1009,20 +1118,20 @@ fn dump_control_area<O: RecoverySink>(
     let mut recovered_pages = HashSet::new();
     let mut seen_subsections = HashSet::new();
     let mut subsections_examined = 0usize;
-    while is_kernel_pointer(subsection)
+    while is_kernel_pointer_for(space, subsection)
         && seen_subsections.insert(subsection)
         && subsections_examined < 65_536
     {
-        let owner = space.read_u64(
+        let owner = space.read_pointer(
             subsection
                 .checked_add(subsection_control)
                 .context("子节控制区字段地址溢出")?,
-        )? & !0xf;
+        )? & !(space.pointer_size() * 2 - 1);
         if owner != control_area {
             break;
         }
         subsections_examined += 1;
-        let prototype_pte = space.read_u64(
+        let prototype_pte = space.read_pointer(
             subsection
                 .checked_add(subsection_base)
                 .context("子节 PTE 基址字段地址溢出")?,
@@ -1039,16 +1148,24 @@ fn dump_control_area<O: RecoverySink>(
                 .checked_add(subsection_start)
                 .context("子节起始扇区字段地址溢出")?,
         )?);
+        // Image subsections use disk sectors, while data subsections use pages.
+        let sector_size = if source == DumpSource::Image {
+            0x200
+        } else {
+            0x1000
+        };
         let subsection_file_offset = starting_sector
-            .checked_mul(0x1000)
+            .checked_mul(sector_size)
             .context("子节文件偏移溢出")?;
-        if is_kernel_pointer(prototype_pte) {
+        if is_kernel_pointer_for(space, prototype_pte) {
             let subsection_pages = ptes_in_subsection.min(page_count);
             for index in 0..subsection_pages {
                 let Some(file_offset) = subsection_file_offset.checked_add(index * 0x1000) else {
                     continue;
                 };
-                if file_offset >= logical_size || !recovered_pages.insert(file_offset) {
+                if file_offset >= logical_size
+                    || (source != DumpSource::Image && recovered_pages.contains(&file_offset))
+                {
                     continue;
                 }
                 let Some(pte_address) = prototype_pte.checked_add(index * 8) else {
@@ -1062,12 +1179,10 @@ fn dump_control_area<O: RecoverySink>(
                     continue;
                 };
                 let length = (logical_size - file_offset).min(0x1000) as usize;
-                let mut page = vec![0u8; length];
-                if image.read_physical(physical, &mut page).is_err() {
+                if !output.copy_physical_page(image, physical, file_offset, length)? {
                     continue;
                 }
-                output.seek(SeekFrom::Start(file_offset))?;
-                output.write_all(&page)?;
+                recovered_pages.insert(file_offset);
                 recovered_bytes += length as u64;
                 push_extent(
                     &mut extents,
@@ -1078,22 +1193,28 @@ fn dump_control_area<O: RecoverySink>(
                 );
             }
         }
-        let next = space.read_u64(
+        let next = space.read_pointer(
             subsection
                 .checked_add(subsection_next)
                 .context("下一子节字段地址溢出")?,
-        )? & !0xf;
+        )?;
         if next == 0 {
             break;
         }
         subsection = next;
     }
     ensure!(subsections_examined > 0, "控制区没有有效的子节链");
+    if source == DumpSource::Image {
+        // Sector-aligned sections can overlap the padding of earlier pages.
+        // Preserve the provenance of the bytes actually left by the last write.
+        extents = normalize_written_extents(extents);
+        recovered_bytes = extents.iter().map(|extent| extent.length).sum();
+    }
     output.resize(extent_output_size(&extents))?;
     let warning = if recovered_bytes == 0 {
         Some("没有可读取的驻留子节 PTE 页面".to_owned())
     } else if source == DumpSource::Image {
-        Some("映像节区输出使用内存映射偏移，不能保证与磁盘上的 PE 逐字节一致".to_owned())
+        Some("映像节按文件扇区偏移重建；驻留页可能包含重定位或运行时修改，不能保证与原始磁盘文件一致".to_owned())
     } else {
         None
     };
@@ -1137,6 +1258,7 @@ fn finish_dump_report(
         missing_bytes: logical_size.saturating_sub(recovered_bytes),
         complete: recovered_bytes == logical_size,
         extents,
+        compressed_pages: Vec::new(),
         warnings: warning.into_iter().collect(),
     }
 }
@@ -1147,6 +1269,48 @@ fn extent_output_size(extents: &[RecoveredExtent]) -> u64 {
         .map(|extent| extent.file_offset.saturating_add(extent.length))
         .max()
         .unwrap_or(0)
+}
+
+/// Resolve overlapping writes without counting a byte twice or attributing it to an overwritten page.
+fn normalize_written_extents(extents: Vec<RecoveredExtent>) -> Vec<RecoveredExtent> {
+    let mut spans: BTreeMap<u64, RecoveredExtent> = BTreeMap::new();
+    for extent in extents {
+        let start = extent.file_offset;
+        let end = start + extent.length;
+        let first = spans
+            .range(..=start)
+            .next_back()
+            .filter(|(_, previous)| previous.file_offset + previous.length > start)
+            .map(|(&offset, _)| offset)
+            .unwrap_or(start);
+        let overlaps: Vec<u64> = spans.range(first..end).map(|(&offset, _)| offset).collect();
+        for key in overlaps {
+            let previous = spans.remove(&key).expect("key was collected from the map");
+            let previous_end = previous.file_offset + previous.length;
+            if previous_end > end {
+                spans.insert(
+                    end,
+                    RecoveredExtent {
+                        file_offset: end,
+                        length: previous_end - end,
+                        memory_address: previous.memory_address + (end - previous.file_offset),
+                        memory_kind: previous.memory_kind.clone(),
+                    },
+                );
+            }
+            if previous.file_offset < start {
+                spans.insert(
+                    previous.file_offset,
+                    RecoveredExtent {
+                        length: start - previous.file_offset,
+                        ..previous
+                    },
+                );
+            }
+        }
+        spans.insert(start, extent);
+    }
+    spans.into_values().collect()
 }
 
 fn push_extent(
@@ -1174,7 +1338,7 @@ fn push_extent(
 
 impl ObjectTypeDecoder {
     fn new(
-        space: &X64AddressSpace<'_>,
+        space: &WindowsAddressSpace<'_>,
         kernel: &WindowsKernelContext,
         profile: &KernelProfile,
     ) -> Result<Self> {
@@ -1189,21 +1353,36 @@ impl ObjectTypeDecoder {
         Ok(Self {
             cookie,
             type_table,
-            type_index_offset: profile.type_field("_OBJECT_HEADER", "TypeIndex")?.offset,
+            type_location: match profile.type_field("_OBJECT_HEADER", "TypeIndex") {
+                Ok(field) => ObjectTypeLocation::Index(field.offset),
+                Err(_) => ObjectTypeLocation::Pointer(
+                    profile.type_field("_OBJECT_HEADER", "Type")?.offset,
+                ),
+            },
             body_offset: profile.type_field("_OBJECT_HEADER", "Body")?.offset,
             type_name_offset: profile.type_field("_OBJECT_TYPE", "Name")?.offset,
         })
     }
 
-    fn type_name(&self, space: &X64AddressSpace<'_>, object_header: u64) -> Option<String> {
-        let raw_index = read_u8(space, object_header + self.type_index_offset).ok()?;
-        let type_index = self
-            .cookie
-            .map(|cookie| raw_index ^ cookie ^ ((object_header >> 8) as u8))
-            .unwrap_or(raw_index);
-        let table = self.type_table?;
-        let object_type = space.read_u64(table + u64::from(type_index) * 8).ok()?;
-        if object_type == 0 {
+    fn type_name(&self, space: &WindowsAddressSpace<'_>, object_header: u64) -> Option<String> {
+        let object_type = match self.type_location {
+            ObjectTypeLocation::Index(offset) => {
+                let raw_index = read_u8(space, object_header + offset).ok()?;
+                let type_index = self
+                    .cookie
+                    .map(|cookie| raw_index ^ cookie ^ ((object_header >> 8) as u8))
+                    .unwrap_or(raw_index);
+                space
+                    .read_pointer(self.type_table? + u64::from(type_index) * space.pointer_size())
+                    .ok()?
+            }
+            // XP/Server 2003 store the _OBJECT_TYPE pointer directly. Never
+            // interpret its low byte as a Vista+ TypeIndex or guess a type ID.
+            ObjectTypeLocation::Pointer(offset) => {
+                space.read_pointer(object_header + offset).ok()?
+            }
+        };
+        if !is_kernel_pointer_width(object_type, space.pointer_size()) {
             return None;
         }
         read_unicode_string(space, object_type + self.type_name_offset, 4096).ok()
@@ -1221,46 +1400,62 @@ fn physical_file_signature(
     {
         return false;
     }
-    let device = image
-        .read_u64_physical(file_object + layout.device_offset)
-        .unwrap_or(1);
-    let section = image
-        .read_u64_physical(file_object + layout.section_offset)
-        .unwrap_or(1);
-    if !is_null_or_kernel_pointer(device) || !is_null_or_kernel_pointer(section) {
+    let device = read_pointer_physical(
+        image,
+        file_object + layout.device_offset,
+        layout.pointer_size,
+    )
+    .unwrap_or(1);
+    let section = read_pointer_physical(
+        image,
+        file_object + layout.section_offset,
+        layout.pointer_size,
+    )
+    .unwrap_or(1);
+    if !is_null_or_kernel_pointer(device, layout.pointer_size)
+        || !is_null_or_kernel_pointer(section, layout.pointer_size)
+    {
         return false;
     }
     let mut descriptor = [0u8; 16];
     if image
-        .read_physical(file_object + layout.name_offset, &mut descriptor)
+        .read_physical(
+            file_object + layout.name_offset,
+            &mut descriptor[..(layout.pointer_size * 2) as usize],
+        )
         .is_err()
     {
         return false;
     }
     let length = u16::from_le_bytes([descriptor[0], descriptor[1]]);
     let maximum = u16::from_le_bytes([descriptor[2], descriptor[3]]);
-    let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
+    let buffer = unicode_buffer(&descriptor, layout.pointer_size);
     length <= maximum
         && length <= 32 * 1024
         && length.is_multiple_of(2)
-        && (length == 0 || is_kernel_pointer(buffer))
+        && (length == 0 || is_kernel_pointer_width(buffer, layout.pointer_size))
 }
 
 fn read_physical_file_object_name(
     image: &MemoryImage,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     descriptor: u64,
     max_bytes: usize,
 ) -> Option<String> {
     let mut header = [0u8; 16];
-    image.read_physical(descriptor, &mut header).ok()?;
+    image
+        .read_physical(
+            descriptor,
+            &mut header[..(space.pointer_size() * 2) as usize],
+        )
+        .ok()?;
     let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
     let maximum = usize::from(u16::from_le_bytes([header[2], header[3]]));
     if length == 0 || length > maximum || length > max_bytes || !length.is_multiple_of(2) {
         return None;
     }
-    let buffer = u64::from_le_bytes(header[8..16].try_into().ok()?);
-    if !is_kernel_pointer(buffer) {
+    let buffer = unicode_buffer(&header, space.pointer_size());
+    if !is_kernel_pointer_for(space, buffer) {
         return None;
     }
     let mut bytes = vec![0u8; length];
@@ -1272,27 +1467,56 @@ fn read_physical_file_object_name(
     decode_file_object_name(&units).ok()
 }
 
-fn is_null_or_kernel_pointer(address: u64) -> bool {
-    address == 0 || is_kernel_pointer(address)
+fn is_null_or_kernel_pointer(address: u64, width: u64) -> bool {
+    address == 0 || is_kernel_pointer_width(address, width)
 }
 
-fn is_kernel_pointer(address: u64) -> bool {
-    address >> 48 == 0xffff && address & 7 == 0
+fn read_pointer_physical(image: &MemoryImage, address: u64, width: u64) -> Result<u64> {
+    ensure!(matches!(width, 4 | 8), "无效的指针宽度");
+    let mut bytes = [0u8; 8];
+    image.read_physical(address, &mut bytes[..width as usize])?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_u8(space: &X64AddressSpace<'_>, address: u64) -> Result<u8> {
+fn unicode_buffer(header: &[u8; 16], width: u64) -> u64 {
+    if width == 4 {
+        u64::from(u32::from_le_bytes([
+            header[4], header[5], header[6], header[7],
+        ]))
+    } else {
+        u64::from_le_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
+        ])
+    }
+}
+
+fn is_kernel_pointer_for(space: &WindowsAddressSpace<'_>, address: u64) -> bool {
+    is_kernel_pointer_width(address, space.pointer_size())
+}
+
+fn is_kernel_pointer_width(address: u64, width: u64) -> bool {
+    let kernel = if width == 4 {
+        (0x8000_0000..=u32::MAX as u64).contains(&address)
+    } else {
+        address >> 48 == 0xffff
+    };
+    kernel && address & (width - 1) == 0
+}
+
+fn read_u8(space: &WindowsAddressSpace<'_>, address: u64) -> Result<u8> {
     let mut bytes = [0u8; 1];
     space.read_virtual(address, &mut bytes)?;
     Ok(bytes[0])
 }
 
-fn read_u16(space: &X64AddressSpace<'_>, address: u64) -> Result<u16> {
+fn read_u16(space: &WindowsAddressSpace<'_>, address: u64) -> Result<u16> {
     let mut bytes = [0u8; 2];
     space.read_virtual(address, &mut bytes)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn read_u32(space: &X64AddressSpace<'_>, address: u64) -> Result<u32> {
+fn read_u32(space: &WindowsAddressSpace<'_>, address: u64) -> Result<u32> {
     let mut bytes = [0u8; 4];
     space.read_virtual(address, &mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
@@ -1305,7 +1529,7 @@ fn read_u16_physical(image: &MemoryImage, address: u64) -> Option<u16> {
 }
 
 fn read_unicode_string(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     descriptor: u64,
     max_bytes: usize,
 ) -> Result<String> {
@@ -1313,7 +1537,7 @@ fn read_unicode_string(
 }
 
 fn read_file_object_name(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     descriptor: u64,
     max_bytes: usize,
 ) -> Result<String> {
@@ -1335,12 +1559,15 @@ fn decode_file_object_name(utf16: &[u16]) -> Result<String> {
 }
 
 fn read_unicode_units(
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     descriptor: u64,
     max_bytes: usize,
 ) -> Result<Vec<u16>> {
     let mut header = [0u8; 16];
-    space.read_virtual(descriptor, &mut header)?;
+    space.read_virtual(
+        descriptor,
+        &mut header[..(space.pointer_size() * 2) as usize],
+    )?;
     let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
     let maximum = usize::from(u16::from_le_bytes([header[2], header[3]]));
     ensure!(length <= maximum, "UNICODE_STRING 长度超过最大值");
@@ -1349,8 +1576,11 @@ fn read_unicode_units(
     if length == 0 {
         return Ok(Vec::new());
     }
-    let buffer = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    ensure!(is_kernel_pointer(buffer), "UNICODE_STRING 缓冲区无效");
+    let buffer = unicode_buffer(&header, space.pointer_size());
+    ensure!(
+        is_kernel_pointer_for(space, buffer),
+        "UNICODE_STRING 缓冲区无效"
+    );
     let mut bytes = vec![0u8; length];
     space.read_virtual(buffer, &mut bytes)?;
     Ok(bytes
@@ -1363,7 +1593,7 @@ fn decode_utf16_strict(utf16: &[u16]) -> Result<String> {
     String::from_utf16(utf16).context("UNICODE_STRING 包含无效的 UTF-16")
 }
 
-fn validate_file_object_name(name: &str) -> bool {
+pub(crate) fn validate_file_object_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().all(|character| {
             let codepoint = u32::from(character);
@@ -1375,7 +1605,7 @@ fn validate_file_object_name(name: &str) -> bool {
         })
 }
 
-fn validate_unverified_file_object_name(name: &str) -> bool {
+pub(crate) fn validate_unverified_file_object_name(name: &str) -> bool {
     if name.starts_with(['\\', ':']) || name.contains('\\') {
         return true;
     }
@@ -1435,6 +1665,29 @@ mod tests {
         assert_eq!(extents.len(), 2);
         assert_eq!(extents[0].length, 0x2000);
         assert_eq!(extent_output_size(&extents), 0x4000);
+    }
+
+    #[test]
+    fn overlapping_image_pages_keep_last_writer_and_unique_coverage() {
+        let mut extents = Vec::new();
+        push_extent(&mut extents, 0, 8192, 0x10000, "physical");
+        push_extent(&mut extents, 1024, 4096, 0x20000, "physical");
+        push_extent(&mut extents, 512, 1024, 0x30000, "physical");
+        let extents = normalize_written_extents(extents);
+        let ranges: Vec<_> = extents
+            .iter()
+            .map(|e| (e.file_offset, e.length, e.memory_address))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, 512, 0x10000),
+                (512, 1024, 0x30000),
+                (1536, 3584, 0x20200),
+                (5120, 3072, 0x11400)
+            ]
+        );
+        assert_eq!(extents.iter().map(|e| e.length).sum::<u64>(), 8192);
     }
 
     #[test]

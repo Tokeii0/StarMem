@@ -23,16 +23,14 @@
 //! report `pages_missing`, and any such region clears `complete` for the whole
 //! report - the search universe was not fully observable.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::address::{VirtualAddressRegion, X64AddressSpace};
+use crate::address::{VirtualAddressRegion, VirtualMapping, X64AddressSpace};
 use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
-use crate::windows::plugins::{VadRecord, list_vads};
+use crate::windows::plugins::{VadRecord, list_vads_cancellable};
 use crate::windows::{WindowsKernelContext, list_processes};
 
 const PAGE_SIZE: u64 = 4096;
@@ -148,6 +146,22 @@ pub struct InjectedRegionReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedRegionStage {
+    Processes,
+    VadTree,
+    PageTables,
+    Regions,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedRegionProgress {
+    pub stage: InjectedRegionStage,
+    pub pid: Option<u64>,
+    pub process_index: usize,
+    pub process_total: usize,
+}
+
 pub fn find_injected_regions(
     image: &MemoryImage,
     kernel: &WindowsKernelContext,
@@ -155,10 +169,27 @@ pub fn find_injected_regions(
     options: &InjectedRegionOptions,
     cancellation: &CancellationToken,
 ) -> Result<InjectedRegionReport> {
+    find_injected_regions_with_progress(image, kernel, profile, options, cancellation, |_| {})
+}
+
+pub fn find_injected_regions_with_progress(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    options: &InjectedRegionOptions,
+    cancellation: &CancellationToken,
+    mut progress: impl FnMut(InjectedRegionProgress),
+) -> Result<InjectedRegionReport> {
     ensure!(options.limit > 0, "注入区间结果上限必须大于零");
     ensure!(options.vad_limit > 0, "VAD 遍历上限必须大于零");
     cancellation.check_cancelled()?;
 
+    progress(InjectedRegionProgress {
+        stage: InjectedRegionStage::Processes,
+        pid: None,
+        process_index: 0,
+        process_total: 0,
+    });
     let processes = list_processes(image, kernel, profile, MAX_ACTIVE_PROCESSES)?;
     let mut warnings = processes
         .warnings
@@ -174,7 +205,12 @@ pub fn find_injected_regions(
     let mut candidate_vads = 0usize;
     let mut truncated = false;
 
-    for process in &processes.processes {
+    let selected_processes = processes
+        .processes
+        .iter()
+        .filter(|process| options.pid.is_none_or(|pid| process.pid == pid))
+        .collect::<Vec<_>>();
+    for (process_index, process) in selected_processes.iter().enumerate() {
         cancellation.check_cancelled()?;
         if let Some(pid) = options.pid {
             if process.pid != pid {
@@ -196,9 +232,24 @@ pub fn find_injected_regions(
             complete = false;
             continue;
         };
-        let vads = match list_vads(image, kernel, profile, process.pid, options.vad_limit) {
+        let mut process_progress = InjectedRegionProgress {
+            stage: InjectedRegionStage::VadTree,
+            pid: Some(process.pid),
+            process_index: process_index + 1,
+            process_total: selected_processes.len(),
+        };
+        progress(process_progress);
+        let vads = match list_vads_cancellable(
+            image,
+            kernel,
+            profile,
+            process.pid,
+            options.vad_limit,
+            cancellation,
+        ) {
             Ok(vads) => vads,
             Err(error) => {
+                cancellation.check_cancelled()?;
                 warnings.push(format!("PID {} 的 VAD 遍历失败：{error:#}", process.pid));
                 complete = false;
                 continue;
@@ -213,15 +264,26 @@ pub fn find_injected_regions(
                 .map(|warning| format!("PID {}: {warning}", process.pid)),
         );
 
-        let mappings =
-            match space.enumerate_mappings(VirtualAddressRegion::User, MAX_MAPPINGS_PER_PROCESS) {
-                Ok(report) => report,
-                Err(error) => {
-                    warnings.push(format!("PID {} 的用户页表遍历失败：{error:#}", process.pid));
-                    complete = false;
-                    continue;
-                }
-            };
+        processes_examined += 1;
+        vads_examined += vads.records.len();
+        if !vads.records.iter().any(is_candidate) {
+            continue;
+        }
+        process_progress.stage = InjectedRegionStage::PageTables;
+        progress(process_progress);
+        let mappings = match space.enumerate_mappings_cancellable(
+            VirtualAddressRegion::User,
+            MAX_MAPPINGS_PER_PROCESS,
+            cancellation,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                cancellation.check_cancelled()?;
+                warnings.push(format!("PID {} 的用户页表遍历失败：{error:#}", process.pid));
+                complete = false;
+                continue;
+            }
+        };
         if mappings.truncated {
             warnings.push(format!(
                 "PID {} 的用户映射达到 {MAX_MAPPINGS_PER_PROCESS} 条上限",
@@ -229,10 +291,17 @@ pub fn find_injected_regions(
             ));
             complete = false;
         }
-        let page_flags = index_page_flags(&mappings);
-
-        processes_examined += 1;
-        vads_examined += vads.records.len();
+        if !mappings.warnings.is_empty() {
+            complete = false;
+            warnings.extend(
+                mappings
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("PID {}: {warning}", process.pid)),
+            );
+        }
+        process_progress.stage = InjectedRegionStage::Regions;
+        progress(process_progress);
 
         for vad in &vads.records {
             cancellation.check_cancelled()?;
@@ -245,8 +314,9 @@ pub fn find_injected_regions(
                 process.pid,
                 &process.name,
                 vad,
-                &page_flags,
+                &mappings.mappings,
                 options,
+                cancellation,
             )?
             else {
                 continue;
@@ -299,20 +369,37 @@ fn is_candidate(vad: &VadRecord) -> bool {
     vad.private_memory && vad.file.is_none() && vad.end > vad.start
 }
 
-/// Per-page PTE flags, keyed by page-aligned virtual address.
-fn index_page_flags(mappings: &crate::address::VirtualMappingReport) -> HashMap<u64, (bool, bool)> {
-    let mut flags = HashMap::new();
-    for mapping in &mappings.mappings {
-        let mut address = mapping.virtual_start;
-        while address < mapping.virtual_end {
-            flags.insert(address, (mapping.writable, mapping.executable));
-            let Some(next) = address.checked_add(PAGE_SIZE) else {
-                break;
-            };
-            address = next;
+/// enumerate_mappings returns sorted, disjoint ranges. Keep those ranges compact:
+/// a sparse multi-TiB VAD must not become billions of absent-page lookups, and a
+/// large-page mapping must not allocate a HashMap entry for every 4 KiB page.
+fn overlapping_mappings(mappings: &[VirtualMapping], start: u64, end: u64) -> &[VirtualMapping] {
+    let first = mappings.partition_point(|mapping| mapping.virtual_end <= start);
+    let count = mappings[first..].partition_point(|mapping| mapping.virtual_start < end);
+    &mappings[first..first + count]
+}
+
+fn mapped_page_counts(
+    mappings: &[VirtualMapping],
+    start: u64,
+    end: u64,
+    cancellation: &CancellationToken,
+) -> Result<(u64, u64, u64)> {
+    cancellation.check_cancelled()?;
+    let mut counts = (0, 0, 0);
+    for mapping in overlapping_mappings(mappings, start, end) {
+        cancellation.check_cancelled()?;
+        let overlap_start = start.max(mapping.virtual_start);
+        let overlap_end = end.min(mapping.virtual_end);
+        let pages = (overlap_end - 1) / PAGE_SIZE - overlap_start / PAGE_SIZE + 1;
+        counts.0 += pages;
+        if mapping.writable {
+            counts.1 += pages;
+        }
+        if mapping.executable {
+            counts.2 += pages;
         }
     }
-    flags
+    Ok(counts)
 }
 
 fn evaluate_region(
@@ -320,36 +407,22 @@ fn evaluate_region(
     pid: u64,
     process: &str,
     vad: &VadRecord,
-    page_flags: &HashMap<u64, (bool, bool)>,
+    mappings: &[VirtualMapping],
     options: &InjectedRegionOptions,
+    cancellation: &CancellationToken,
 ) -> Result<Option<InjectedRegionRecord>> {
     let length = vad
         .end
         .checked_sub(vad.start)
         .and_then(|span| span.checked_add(1))
         .with_context(|| format!("VAD {:#x} 的区间长度非法", vad.node))?;
-    let pages_total = length.div_ceil(PAGE_SIZE);
-
-    let mut pages_resident = 0u64;
-    let mut pages_writable = 0u64;
-    let mut pages_executable = 0u64;
-    let mut address = vad.start & !(PAGE_SIZE - 1);
-    let region_end = vad.start.saturating_add(length);
-    while address < region_end {
-        if let Some(&(writable, executable)) = page_flags.get(&address) {
-            pages_resident += 1;
-            if writable {
-                pages_writable += 1;
-            }
-            if executable {
-                pages_executable += 1;
-            }
-        }
-        let Some(next) = address.checked_add(PAGE_SIZE) else {
-            break;
-        };
-        address = next;
-    }
+    let region_end = vad
+        .end
+        .checked_add(1)
+        .with_context(|| format!("VAD {:#x} 的结束地址溢出", vad.node))?;
+    let pages_total = vad.end / PAGE_SIZE - vad.start / PAGE_SIZE + 1;
+    let (pages_resident, pages_writable, pages_executable) =
+        mapped_page_counts(mappings, vad.start, region_end, cancellation)?;
     let pages_missing = pages_total.saturating_sub(pages_resident);
 
     let vad_writable = protection_is_writable(vad.protection, &vad.protection_name);
@@ -368,7 +441,8 @@ fn evaluate_region(
         return Ok(None);
     }
 
-    let (entropy, sampled_bytes, first_printable) = triage_sample(space, vad.start, region_end);
+    let (entropy, sampled_bytes, first_printable) =
+        triage_sample(space, mappings, vad.start, region_end, cancellation)?;
 
     Ok(Some(InjectedRegionRecord {
         pid,
@@ -433,33 +507,55 @@ fn protection_is_executable(protection: u8, name: &str) -> bool {
 
 fn triage_sample(
     space: &X64AddressSpace<'_>,
+    mappings: &[VirtualMapping],
     start: u64,
     end: u64,
-) -> (Option<f64>, u64, Option<String>) {
+    cancellation: &CancellationToken,
+) -> Result<(Option<f64>, u64, Option<String>)> {
     let span = end.saturating_sub(start);
     let want = span.min(TRIAGE_SAMPLE_BYTES as u64) as usize;
     if want == 0 {
-        return (None, 0, None);
+        return Ok((None, 0, None));
     }
     let mut sample = Vec::with_capacity(want);
     let mut buffer = [0u8; PAGE_SIZE as usize];
-    let mut address = start;
-    while sample.len() < want && address < end {
-        let take = ((end - address).min(PAGE_SIZE) as usize).min(want - sample.len());
-        if space.read_virtual(address, &mut buffer[..take]).is_ok() {
-            sample.extend_from_slice(&buffer[..take]);
+    let mut attempted = 0;
+    let mut contiguous = Vec::new();
+    let mut previous_end = None;
+    let mut printable = None;
+    for mapping in overlapping_mappings(mappings, start, end) {
+        let mut address = start.max(mapping.virtual_start);
+        let mapping_end = end.min(mapping.virtual_end);
+        while attempted < want && address < mapping_end {
+            cancellation.check_cancelled()?;
+            let take = ((mapping_end - address).min(PAGE_SIZE - address % PAGE_SIZE) as usize)
+                .min(want - attempted);
+            attempted += take; // Unreadable physical backing must also consume the sample budget.
+            if previous_end != Some(address) {
+                printable = printable.or_else(|| first_printable_run(&contiguous));
+                contiguous.clear();
+            }
+            if space.read_virtual(address, &mut buffer[..take]).is_ok() {
+                sample.extend_from_slice(&buffer[..take]);
+                contiguous.extend_from_slice(&buffer[..take]);
+                previous_end = Some(address + take as u64);
+            } else {
+                printable = printable.or_else(|| first_printable_run(&contiguous));
+                contiguous.clear();
+                previous_end = None;
+            }
+            address += take as u64;
         }
-        let Some(next) = address.checked_add(PAGE_SIZE) else {
+        if attempted >= want {
             break;
-        };
-        address = next;
+        }
     }
     if sample.is_empty() {
-        return (None, 0, None);
+        return Ok((None, 0, None));
     }
     let entropy = shannon_entropy(&sample);
-    let printable = first_printable_run(&sample);
-    (Some(entropy), sample.len() as u64, printable)
+    let printable = printable.or_else(|| first_printable_run(&contiguous));
+    Ok((Some(entropy), sample.len() as u64, printable))
 }
 
 fn shannon_entropy(data: &[u8]) -> f64 {
@@ -728,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn page_flags_are_indexed_per_page_not_per_mapping() {
+    fn merged_mapping_counts_every_page_without_expanding_it() {
         let report = crate::address::VirtualMappingReport {
             directory_table_base: 0x1000,
             region: "user".to_owned(),
@@ -749,10 +845,21 @@ mod tests {
             }],
             warnings: Vec::new(),
         };
-        let flags = index_page_flags(&report);
-        assert_eq!(flags.len(), 2);
-        assert_eq!(flags.get(&0x60000), Some(&(false, false)));
-        assert_eq!(flags.get(&0x61000), Some(&(false, false)));
-        assert_eq!(flags.get(&0x62000), None);
+        let token = CancellationToken::new();
+        assert_eq!(
+            mapped_page_counts(&report.mappings, 0x60000, 0x62000, &token).unwrap(),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            mapped_page_counts(&report.mappings, 0x61000, 0x62000, &token).unwrap(),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            mapped_page_counts(&report.mappings, 0x62000, 0x63000, &token).unwrap(),
+            (0, 0, 0)
+        );
     }
 }
+
+#[cfg(test)]
+mod performance_tests;

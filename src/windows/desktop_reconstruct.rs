@@ -6,7 +6,8 @@ use anyhow::{Result, ensure};
 use serde::Serialize;
 
 use super::WindowsKernelContext;
-use super::dwm_surfaces::{DwmFrameRecord, recover_dwm_surfaces};
+use super::desktop_pixels::{PixelRecoveryReport, recover_pixel_candidates};
+use super::dwm_surfaces::{DwmFrameRecord, recover_dwm_surfaces_in_session};
 use super::gui_plugins::{WindowRecord, WindowRect, windows};
 use crate::cancellation::CancellationToken;
 use crate::image::MemoryImage;
@@ -30,6 +31,7 @@ pub struct DesktopReconstructOptions {
 pub struct DesktopReconstructReport {
     pub desktops: Vec<DesktopCanvasRecord>,
     pub frames: Vec<DwmFrameRecord>,
+    pub pixel_recovery: PixelRecoveryReport,
     pub manifest: PathBuf,
     pub windows_examined: usize,
     pub visible_windows: usize,
@@ -37,6 +39,8 @@ pub struct DesktopReconstructReport {
     pub pixel_backed_windows: usize,
     pub pixel_backed_frames: usize,
     pub pixel_coverage_percent: f64,
+    pub layout_complete: bool,
+    pub pixel_bytes_complete: bool,
     pub complete: bool,
     pub warnings: Vec<String>,
 }
@@ -178,48 +182,90 @@ pub fn reconstruct_desktops(
     if desktops.is_empty() {
         warnings.push("没有生成桌面布局画布".to_owned());
     }
-    let (frames, dwm_complete) = match recover_dwm_surfaces(
+    let pixel_recovery = match recover_pixel_candidates(
         image,
         kernel,
         profile,
-        symbol_store,
-        &options.output,
-        options.max_dimension,
-        options.force,
+        &window_report.records,
+        options,
         cancellation,
     ) {
-        Ok(dwm) => {
-            warnings.extend(dwm.warnings);
-            (dwm.frames, dwm.complete)
-        }
+        Ok(report) => report,
         Err(error) => {
-            warnings.push(format!("DWM 像素表面恢复失败：{error:#}"));
-            (Vec::new(), false)
+            cancellation.check_cancelled()?;
+            PixelRecoveryReport {
+                search_complete: false,
+                warnings: vec![format!("通用像素候选恢复失败：{error:#}")],
+                ..Default::default()
+            }
         }
     };
+    warnings.extend(pixel_recovery.warnings.iter().cloned());
+    let (frames, dwm_complete) = if options.desktop.is_some() {
+        warnings.push(
+            "已按桌面名称筛选尺寸候选；旧 DWM 对象链缺少可验证的桌面名归属，跳过该路径".into(),
+        );
+        (Vec::new(), true)
+    } else {
+        match recover_dwm_surfaces_in_session(
+            image,
+            kernel,
+            profile,
+            symbol_store,
+            &options.output,
+            options.max_dimension,
+            options.force,
+            options.session_id,
+            cancellation,
+        ) {
+            Ok(dwm) => {
+                warnings.extend(dwm.warnings);
+                (dwm.frames, dwm.complete)
+            }
+            Err(error) => {
+                warnings.push(format!("DWM 像素表面恢复失败：{error:#}"));
+                (Vec::new(), false)
+            }
+        }
+    };
+    cancellation.check_cancelled()?;
     let rendered_windows = desktops.iter().map(|canvas| canvas.rendered_windows).sum();
     let pixel_coverage_percent = frames
         .iter()
         .map(|frame| frame.coverage_percent)
+        .chain(
+            pixel_recovery
+                .records
+                .iter()
+                .map(|record| record.coverage_percent),
+        )
         .fold(0.0f64, f64::max);
-    let pixel_frames_complete = !frames.is_empty()
-        && dwm_complete
+    let pixel_backed_frames = frames.len() + pixel_recovery.records.len();
+    let pixel_bytes_complete = pixel_backed_frames != 0
         && frames
             .iter()
-            .all(|frame| frame.recovered_bytes == frame.total_bytes);
+            .all(|frame| frame.recovered_bytes == frame.total_bytes)
+        && pixel_recovery
+            .records
+            .iter()
+            .all(|record| record.bytes_complete);
     let layout_complete = window_report.complete && !desktops.is_empty();
-    let complete = pixel_frames_complete || layout_complete;
+    // Layout success cannot hide unreadable pixel candidates or an incomplete search.
+    let complete = layout_complete && dwm_complete && pixel_recovery.search_complete;
     let manifest = options.output.join("desktop-reconstruct-report.json");
     let report = DesktopReconstructReport {
         desktops,
-        pixel_backed_frames: frames.len(),
+        pixel_backed_frames,
         frames,
+        pixel_recovery,
         manifest: manifest.clone(),
         windows_examined,
         visible_windows,
         rendered_windows,
         pixel_backed_windows: 0,
         pixel_coverage_percent,
+        layout_complete,
+        pixel_bytes_complete,
         complete,
         warnings,
     };
@@ -409,6 +455,7 @@ mod tests {
             desktop: "Default".to_owned(),
             title: Some("Window".to_owned()),
             procedure: None,
+            geometry_address: None,
             process: Some("app.exe".to_owned()),
             pid: Some(42),
             parent: None,

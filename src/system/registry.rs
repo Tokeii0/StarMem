@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -440,6 +441,11 @@ pub struct RegistryEvidence<T> {
 pub struct RegistryPrintRecord {
     pub depth: usize,
     pub kind: String,
+    /// Exact recovered hive and nk/vk identities, never inferred from a name.
+    pub cmhive: Option<u64>,
+    pub cell_index: u32,
+    pub key_cell_index: u32,
+    pub key_identity: Option<String>,
     pub path: String,
     pub name: String,
     pub data_type: Option<u32>,
@@ -466,11 +472,14 @@ pub struct UserAssistRecord {
 
 #[derive(Debug, Serialize)]
 pub struct AmcacheRecord {
+    pub hive: String,
+    pub key_path: String,
     pub entry_type: String,
     pub key_name: String,
     pub path: Option<String>,
     pub program_id: Option<String>,
     pub sha1: Option<String>,
+    pub sha1_raw: Option<String>,
     pub product_name: Option<String>,
     pub product_version: Option<String>,
     pub publisher: Option<String>,
@@ -482,6 +491,7 @@ pub struct AmcacheRecord {
 
 pub(crate) struct RecoveredTargetHive {
     pub(crate) hive: Option<RegistryHive>,
+    pub(crate) cmhive: Option<u64>,
     pub(crate) complete: bool,
     pub(crate) warnings: Vec<String>,
 }
@@ -504,6 +514,7 @@ where
 {
     let mut output = RecoveredTargetHive {
         hive: None,
+        cmhive: None,
         complete: processes.complete,
         warnings: Vec::new(),
     };
@@ -562,7 +573,21 @@ where
                         .into_iter()
                         .map(|warning| format!("{source}: {warning}"))
                         .collect::<Vec<_>>();
-                    match RegistryHive::from_bytes(memory.bytes)
+                    let recovered_ranges = memory
+                        .report
+                        .extents
+                        .iter()
+                        .map(|extent| {
+                            let start = usize::try_from(extent.file_offset)?;
+                            let length = usize::try_from(extent.length)?;
+                            let end = start
+                                .checked_add(length)
+                                .context("recovered hive range overflow")?;
+                            Ok(start..end)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>();
+                    match recovered_ranges
+                        .and_then(|ranges| RegistryHive::from_recovered_bytes(memory.bytes, ranges))
                         .and_then(|hive| validator(&hive).map(|()| hive))
                     {
                         Ok(hive) => successes.push((
@@ -572,9 +597,12 @@ where
                             candidate_complete,
                             candidate_warnings,
                         )),
-                        Err(error) => rejected.push(format!(
-                            "活动候选 {source}（CMHIVE {cmhive:#x}）未通过凭据完整性校验：{error:#}"
-                        )),
+                        Err(error) => {
+                            rejected.push(format!(
+                                "活动候选 {source}（CMHIVE {cmhive:#x}）未通过凭据完整性校验：{error:#}"
+                            ));
+                            rejected.extend(candidate_warnings);
+                        }
                     }
                 }
                 Err(error) => rejected.push(format!(
@@ -584,11 +612,12 @@ where
         }
         match successes.len() {
             1 => {
-                let (_, _, hive, candidate_complete, mut candidate_warnings) =
+                let (cmhive, _, hive, candidate_complete, mut candidate_warnings) =
                     successes.pop().expect("one validated hive candidate");
                 output.complete &= candidate_complete;
                 output.warnings.append(&mut candidate_warnings);
                 output.hive = Some(hive);
+                output.cmhive = Some(cmhive);
                 return output;
             }
             count if count > 1 => {
@@ -701,16 +730,22 @@ fn recover_hives_matching(
     output
 }
 
-fn registry_process_dtb(processes: &ProcessListReport) -> Option<u64> {
+pub(crate) fn registry_process_dtb(processes: &ProcessListReport) -> Option<u64> {
     processes
         .processes
         .iter()
         .find(|process| process.name.eq_ignore_ascii_case("Registry") && process.ppid == Some(4))
         .and_then(|process| {
-            process
-                .details
-                .user_directory_table_base
-                .or(process.details.directory_table_base)
+            // The full process page table maps both HMAP metadata and the
+            // private hive views. The KPTI user table can contain only flags
+            // (for example 1) and must not hide a usable full process DTB.
+            [
+                process.details.directory_table_base,
+                process.details.user_directory_table_base,
+            ]
+            .into_iter()
+            .flatten()
+            .find(|dtb| dtb & 0x000f_ffff_ffff_f000 != 0)
         })
 }
 
@@ -760,6 +795,10 @@ pub fn analyze_scheduled_task_registry(
     }
 }
 
+fn registry_key_identity(cmhive: Option<u64>, cell_index: u32) -> Option<String> {
+    cmhive.map(|address| format!("{address:016x}:{cell_index:08x}"))
+}
+
 pub fn print_registry_key(
     session: &AnalysisSession,
     processes: &ProcessListReport,
@@ -799,6 +838,28 @@ pub fn print_registry_key_exact_loaded(
     print_registry_key_from_target(target, expected_root_path, key_path, recurse, limit)
 }
 
+/// Reuse the existing key/value decoder with an explicitly recovered stable Hive.
+pub fn print_registry_hive(
+    hive: RegistryHive,
+    source: &str,
+    key: &str,
+    recurse: bool,
+    limit: usize,
+) -> RegistryEvidence<RegistryPrintRecord> {
+    print_registry_key_from_target(
+        RecoveredTargetHive {
+            hive: Some(hive),
+            cmhive: None,
+            complete: true,
+            warnings: Vec::new(),
+        },
+        source,
+        key,
+        recurse,
+        limit,
+    )
+}
+
 fn print_registry_key_from_target(
     mut target: RecoveredTargetHive,
     root_path: &str,
@@ -814,7 +875,14 @@ fn print_registry_key_from_target(
             warnings: target.warnings,
         };
     };
-    let start = match hive.open_key(key_path) {
+    let lookup = hive.open_key_best_effort(key_path).map(|lookup| {
+        if !lookup.warnings.is_empty() {
+            target.complete = false;
+        }
+        target.warnings.extend(lookup.warnings);
+        lookup.key
+    });
+    let start = match lookup {
         Ok(Some(key)) => key,
         Ok(None) => {
             target.complete = false;
@@ -863,6 +931,10 @@ fn print_registry_key_from_target(
         records.push(RegistryPrintRecord {
             depth,
             kind: "key".to_owned(),
+            cmhive: target.cmhive,
+            cell_index: key.cell_index,
+            key_cell_index: key.cell_index,
+            key_identity: registry_key_identity(target.cmhive, key.cell_index),
             path: path.clone(),
             name: key.name.clone(),
             data_type: None,
@@ -871,9 +943,13 @@ fn print_registry_key_from_target(
             last_write_raw: key.last_write_raw,
             last_write: filetime_to_rfc3339(key.last_write_raw),
         });
-        match hive.values(&key) {
+        match hive.values_best_effort(&key) {
             Ok(values) => {
-                for value in values {
+                if !values.warnings.is_empty() {
+                    target.complete = false;
+                }
+                target.warnings.extend(values.warnings);
+                for value in values.values {
                     if records.len() == limit {
                         target.complete = false;
                         target
@@ -884,6 +960,10 @@ fn print_registry_key_from_target(
                     records.push(RegistryPrintRecord {
                         depth: depth + 1,
                         kind: "value".to_owned(),
+                        cmhive: target.cmhive,
+                        cell_index: value.cell_index,
+                        key_cell_index: key.cell_index,
+                        key_identity: registry_key_identity(target.cmhive, key.cell_index),
                         path: path.clone(),
                         name: if value.name.is_empty() {
                             "(Default)".to_owned()
@@ -925,6 +1005,13 @@ fn print_registry_key_from_target(
                             records.push(RegistryPrintRecord {
                                 depth: depth + 1,
                                 kind: "key".to_owned(),
+                                cmhive: target.cmhive,
+                                cell_index: child.cell_index,
+                                key_cell_index: child.cell_index,
+                                key_identity: registry_key_identity(
+                                    target.cmhive,
+                                    child.cell_index,
+                                ),
                                 path: child_path,
                                 name: child.name,
                                 data_type: None,
@@ -933,6 +1020,13 @@ fn print_registry_key_from_target(
                                 last_write_raw: child.last_write_raw,
                                 last_write: filetime_to_rfc3339(child.last_write_raw),
                             });
+                        } else {
+                            target.complete = false;
+                            push_registry_warning(
+                                &mut target.warnings,
+                                format!("注册表输出结果达到 {limit} 条上限"),
+                            );
+                            break;
                         }
                     }
                 }
@@ -959,20 +1053,93 @@ pub fn analyze_userassist(
     processes: &ProcessListReport,
     limit: usize,
 ) -> RegistryEvidence<UserAssistRecord> {
-    let mut hives = recover_hives_matching(session, processes, |hive| {
+    let hives = recover_hives_matching(session, processes, |hive| {
         [&hive.file_path, &hive.user_name]
             .into_iter()
             .any(|name| name.to_ascii_lowercase().ends_with("\\ntuser.dat"))
     });
+    userassist_from_recovered(hives, limit)
+}
+
+/// Decode a selected file-backed Hive without opening a symbol-dependent session.
+pub fn userassist_from_hive(
+    hive: RegistryHive,
+    source: &str,
+    limit: usize,
+) -> RegistryEvidence<UserAssistRecord> {
+    userassist_from_recovered(
+        RecoveredHiveSet {
+            hives: vec![RecoveredNamedHive {
+                source: source.into(),
+                hive,
+            }],
+            complete: true,
+            warnings: Vec::new(),
+        },
+        limit,
+    )
+}
+
+fn artifact_open_key(
+    hive: &RegistryHive,
+    path: &str,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> Option<RegistryKey> {
+    match hive.open_key_best_effort(path) {
+        Ok(result) => {
+            warnings.extend(
+                result
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("{context}: {warning}")),
+            );
+            result.key
+        }
+        Err(error) => {
+            push_registry_warning(warnings, format!("无法读取 {context} 的 {path}：{error:#}"));
+            None
+        }
+    }
+}
+
+fn artifact_values(
+    hive: &RegistryHive,
+    key: &RegistryKey,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<RegistryValue> {
+    match hive.values_best_effort(key) {
+        Ok(result) => {
+            warnings.extend(
+                result
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("{context}: {warning}")),
+            );
+            result.values
+        }
+        Err(error) => {
+            push_registry_warning(warnings, format!("无法枚举 {context} 的值：{error:#}"));
+            Vec::new()
+        }
+    }
+}
+
+fn userassist_from_recovered(
+    mut hives: RecoveredHiveSet,
+    limit: usize,
+) -> RegistryEvidence<UserAssistRecord> {
+    let initial_warnings = hives.warnings.len();
     let mut records = Vec::new();
     let mut limit_reached = false;
     'userassist: for recovered in &hives.hives {
-        let Some(base) = recovered
-            .hive
-            .open_key("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist")
-            .ok()
-            .flatten()
-        else {
+        let Some(base) = artifact_open_key(
+            &recovered.hive,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist",
+            &recovered.source,
+            &mut hives.warnings,
+        ) else {
             continue;
         };
         for guid in best_effort_subkeys(
@@ -981,23 +1148,22 @@ pub fn analyze_userassist(
             &format!("UserAssist {}", recovered.source),
             &mut hives.warnings,
         ) {
-            let Some(count) = recovered.hive.subkeys(&guid).ok().and_then(|keys| {
-                keys.into_iter()
-                    .find(|key| key.name.eq_ignore_ascii_case("Count"))
-            }) else {
+            let Some(count) = best_effort_subkeys(
+                &recovered.hive,
+                &guid,
+                &format!("UserAssist {} {}", recovered.source, guid.name),
+                &mut hives.warnings,
+            )
+            .into_iter()
+            .find(|key| key.name.eq_ignore_ascii_case("Count")) else {
                 continue;
             };
-            let values = match recovered.hive.values(&count) {
-                Ok(values) => values,
-                Err(error) => {
-                    hives.complete = false;
-                    push_registry_warning(
-                        &mut hives.warnings,
-                        format!("无法枚举 UserAssist {} 的值：{error:#}", guid.name),
-                    );
-                    continue;
-                }
-            };
+            let values = artifact_values(
+                &recovered.hive,
+                &count,
+                &format!("UserAssist {} {}", recovered.source, guid.name),
+                &mut hives.warnings,
+            );
             for value in values {
                 if records.len() == limit {
                     hives.complete = false;
@@ -1006,7 +1172,7 @@ pub fn analyze_userassist(
                 }
                 let raw = value.raw_data();
                 let (session_id, run_count, focus_count, focus_time_ms, last_execution_raw) =
-                    if raw.len() >= 72 {
+                    if value.data_type == 3 && raw.len() == 72 {
                         (
                             None,
                             read_slice_u32(raw, 4),
@@ -1014,7 +1180,7 @@ pub fn analyze_userassist(
                             read_slice_u32(raw, 12),
                             read_slice_u64(raw, 60),
                         )
-                    } else if raw.len() >= 16 {
+                    } else if value.data_type == 3 && raw.len() == 16 {
                         let stored = read_slice_u32(raw, 4);
                         (
                             read_slice_u32(raw, 0),
@@ -1024,6 +1190,16 @@ pub fn analyze_userassist(
                             read_slice_u64(raw, 8),
                         )
                     } else {
+                        push_registry_warning(
+                            &mut hives.warnings,
+                            format!(
+                                "UserAssist {} {} 的类型/长度不支持（type={}，{} 字节）；仅保留原始数据",
+                                guid.name,
+                                value.name,
+                                value.data_type,
+                                raw.len()
+                            ),
+                        );
                         (None, None, None, None, None)
                     };
                 let last_execution_raw = last_execution_raw.filter(|value| {
@@ -1054,7 +1230,7 @@ pub fn analyze_userassist(
     RegistryEvidence {
         records,
         available: !hives.hives.is_empty(),
-        complete: hives.complete,
+        complete: hives.complete && hives.warnings.len() == initial_warnings,
         warnings: hives.warnings,
     }
 }
@@ -1064,22 +1240,55 @@ pub fn analyze_amcache(
     processes: &ProcessListReport,
     limit: usize,
 ) -> RegistryEvidence<AmcacheRecord> {
-    let mut hives = recover_hives_matching(session, processes, |hive| {
+    let hives = recover_hives_matching(session, processes, |hive| {
         [&hive.file_path, &hive.user_name]
             .into_iter()
             .any(|name| name.to_ascii_lowercase().ends_with("\\amcache.hve"))
     });
+    amcache_from_recovered(hives, limit)
+}
+
+pub fn amcache_from_hive(
+    hive: RegistryHive,
+    source: &str,
+    limit: usize,
+) -> RegistryEvidence<AmcacheRecord> {
+    amcache_from_recovered(
+        RecoveredHiveSet {
+            hives: vec![RecoveredNamedHive {
+                source: source.into(),
+                hive,
+            }],
+            complete: true,
+            warnings: Vec::new(),
+        },
+        limit,
+    )
+}
+
+fn amcache_from_recovered(
+    mut hives: RecoveredHiveSet,
+    limit: usize,
+) -> RegistryEvidence<AmcacheRecord> {
+    let initial_warnings = hives.warnings.len();
     let mut records = Vec::new();
-    for recovered in &hives.hives {
+    'amcache: for recovered in &hives.hives {
+        let mut recognized = false;
         for (path, entry_type) in [
             ("Root\\InventoryApplication", "program"),
             ("Root\\InventoryApplicationFile", "file"),
             ("Root\\InventoryDriverBinary", "driver"),
             ("Root\\Programs", "program"),
         ] {
-            let Some(root) = recovered.hive.open_key(path).ok().flatten() else {
+            let Some(root) = artifact_open_key(
+                &recovered.hive,
+                path,
+                &recovered.source,
+                &mut hives.warnings,
+            ) else {
                 continue;
             };
+            recognized = true;
             for key in best_effort_subkeys(
                 &recovered.hive,
                 &root,
@@ -1091,9 +1300,14 @@ pub fn analyze_amcache(
                     hives
                         .warnings
                         .push(format!("Amcache 结果达到 {limit} 条上限"));
-                    break;
+                    break 'amcache;
                 }
-                let values = recovered.hive.values(&key).unwrap_or_default();
+                let values = artifact_values(
+                    &recovered.hive,
+                    &key,
+                    &format!("Amcache {} {path}\\{}", recovered.source, key.name),
+                    &mut hives.warnings,
+                );
                 let string = |names: &[&str]| {
                     names.iter().find_map(|name| {
                         values
@@ -1115,17 +1329,38 @@ pub fn analyze_amcache(
                 } else {
                     &["DriverId"]
                 });
+                let sha1_raw = sha1.clone();
                 if let Some(value) = &mut sha1 {
-                    while value.starts_with("0000") {
+                    // FileId uses a four-character prefix; leading zeroes in a
+                    // 40-character digest belong to the hash and must survive.
+                    if value.len() == 44
+                        && value.starts_with("0000")
+                        && value.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
                         value.drain(..4);
                     }
                 }
+                if sha1.as_ref().is_some_and(|value| {
+                    value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit())
+                }) {
+                    push_registry_warning(
+                        &mut hives.warnings,
+                        format!(
+                            "Amcache {path}\\{} 的摘要格式不支持；原文保留在 sha1_raw",
+                            key.name
+                        ),
+                    );
+                    sha1 = None;
+                }
                 records.push(AmcacheRecord {
+                    hive: recovered.source.clone(),
+                    key_path: format!("{path}\\{}", key.name),
                     entry_type: entry_type.to_owned(),
                     key_name: key.name.clone(),
                     path: path_value,
                     program_id: string(&["ProgramId", "100"]),
                     sha1,
+                    sha1_raw,
                     product_name: string(&["ProductName", "Name", "0"]),
                     product_version: string(&["ProductVersion", "Version", "1", "d"]),
                     publisher: string(&["Publisher", "Company", "2", "1"]),
@@ -1136,11 +1371,20 @@ pub fn analyze_amcache(
                 });
             }
         }
+        if !recognized {
+            push_registry_warning(
+                &mut hives.warnings,
+                format!(
+                    "{} 未找到支持的 Amcache 清单分支；旧版 Root\\File 布局尚未覆盖",
+                    recovered.source
+                ),
+            );
+        }
     }
     RegistryEvidence {
         records,
         available: !hives.hives.is_empty(),
-        complete: hives.complete,
+        complete: hives.complete && hives.warnings.len() == initial_warnings,
         warnings: hives.warnings,
     }
 }
@@ -1152,6 +1396,7 @@ pub(crate) fn recover_target_hive(
 ) -> RecoveredTargetHive {
     let mut output = RecoveredTargetHive {
         hive: None,
+        cmhive: None,
         complete: processes.complete,
         warnings: Vec::new(),
     };
@@ -1288,6 +1533,7 @@ fn recover_exact_loaded_hive(
 ) -> RecoveredTargetHive {
     let mut output = RecoveredTargetHive {
         hive: None,
+        cmhive: None,
         complete: processes.complete,
         warnings: Vec::new(),
     };
@@ -1348,6 +1594,7 @@ fn recover_exact_loaded_hive(
             output.complete &= recovered.complete;
             output.warnings.append(&mut recovered.warnings);
             output.hive = Some(recovered.hive);
+            output.cmhive = Some(cmhive);
         }
         Err(error) => {
             output.complete = false;
@@ -1429,6 +1676,7 @@ fn recover_candidate_hive(
             match RegistryHive::from_bytes(memory.bytes) {
                 Ok(hive) if hive_semantically_matches(&hive, root_path) => {
                     output.hive = Some(hive);
+                    output.cmhive = Some(cmhive);
                     true
                 }
                 Ok(_) => {
@@ -1509,6 +1757,44 @@ pub fn analyze_registry(
     processes: &ProcessListReport,
 ) -> RegistrySystemInfo {
     analyze_registry_with_system_hive(session, processes).0
+}
+
+/// Decode one file-backed Hive without claiming an active CMHIVE or live state.
+/// The caller supplies checked byte ranges and keeps acquisition provenance.
+pub fn analyze_registry_file(
+    hive: RegistryHive,
+    kind: &str,
+    source: &str,
+) -> anyhow::Result<RegistrySystemInfo> {
+    let mut output = RegistrySystemInfo::default();
+    match kind {
+        "system" => parse_system_hive(&hive, &mut output),
+        "software" => parse_software_hive(&hive, &mut output),
+        "sam" => parse_sam_hive(&hive, &mut output),
+        "ntuser" => {
+            parse_user_hives(
+                &[LoadedHive {
+                    cmhive: 0,
+                    root_path: String::new(),
+                    source_name: source.to_owned(),
+                    hive,
+                }],
+                &mut output,
+            );
+        }
+        _ => anyhow::bail!("此 Hive 类型暂仅支持键值读取：{kind}"),
+    }
+    derive_network_artifacts(&mut output);
+    derive_service_artifacts(&mut output);
+    output.available = true;
+    // These flags belong to an active in-memory Hive acquisition, which this path does not establish.
+    output.hive_enumeration_complete = false;
+    output.usb_source_complete = false;
+    output.system_persistence_complete = false;
+    output.software_persistence_complete = false;
+    output.user_persistence_complete = false;
+    output.warnings.push("文件来源仅代表所选 Hive 的已恢复稳定数据；未核验活动 CMHIVE、易失性键、事务日志或当前运行状态".into());
+    Ok(output)
 }
 
 /// Analyze all supported registry artifacts and also return the exact parsed
@@ -3851,8 +4137,43 @@ fn decode_probable_utf16(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "registry_artifact_tests.rs"]
+pub(crate) mod artifact_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_hive_mapping_uses_full_process_dtb_and_rejects_flag_only_values() {
+        use crate::windows::{ProcessDetails, ProcessListStopReason, ProcessRecord};
+        let mut processes = ProcessListReport {
+            processes: vec![ProcessRecord {
+                eprocess: 0xffff_8000_0000_1000,
+                pid: 108,
+                ppid: Some(4),
+                name: "Registry".to_owned(),
+                details: ProcessDetails {
+                    directory_table_base: Some(0x4e1002),
+                    user_directory_table_base: Some(1),
+                    ..Default::default()
+                },
+            }],
+            complete: true,
+            stop_reason: ProcessListStopReason::ListHead,
+            warnings: Vec::new(),
+        };
+        assert_eq!(registry_process_dtb(&processes), Some(0x4e1002));
+        processes.processes[0].details.user_directory_table_base = Some(0x8001);
+        assert_eq!(registry_process_dtb(&processes), Some(0x4e1002));
+        processes.processes[0].details.directory_table_base = Some(0);
+        assert_eq!(registry_process_dtb(&processes), Some(0x8001));
+        processes.processes[0].details.user_directory_table_base = Some(1);
+        assert_eq!(registry_process_dtb(&processes), None);
+        processes.processes[0].details.directory_table_base = Some(0x4e1002);
+        processes.processes[0].ppid = Some(88);
+        assert_eq!(registry_process_dtb(&processes), None);
+    }
 
     #[test]
     fn converts_real_hacker_registry_timestamps() {

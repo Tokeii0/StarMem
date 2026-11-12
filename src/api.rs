@@ -675,6 +675,14 @@ impl Session {
         &self.source_identity
     }
 
+    /// 底层分析会话，供宿主调用写出型能力（如 `recover_file` 导出文件）。
+    ///
+    /// 该入口复用已打开的会话，避免为写出操作重复解析镜像；它不在
+    /// `INTEGRATION_API_VERSION` 的兼容承诺范围内。
+    pub fn analysis_session(&self) -> &AnalysisSession {
+        &self.inner
+    }
+
     fn run_inner(
         &self,
         request: &RunRequest,
@@ -1015,14 +1023,23 @@ fn envelope_from_value(
             command_id,
         ));
     }
-    let scope = deserialize_optional(root, "scope")?.unwrap_or_else(|| {
+    let default_scope = || {
         let mut scope = EvidenceScope::new("memory_image");
         scope.constraints.insert(
             "command_id".to_owned(),
             Value::String(command_id.to_owned()),
         );
         scope
-    });
+    };
+    // 部分插件把 scope 写成人类可读的范围说明；保留为 description，而不是让整次运行失败。
+    let scope = match root.get("scope") {
+        Some(Value::String(description)) => {
+            let mut scope = default_scope();
+            scope.description = Some(description.clone());
+            scope
+        }
+        _ => deserialize_optional(root, "scope")?.unwrap_or_else(default_scope),
+    };
     let reported_limits =
         deserialize_optional::<Vec<EvidenceLimit>>(root, "limits")?.unwrap_or_default();
     for mut reported in reported_limits {
@@ -1145,6 +1162,27 @@ mod tests {
             capabilities
                 .runnable_command_ids
                 .contains(&"windows.process-string".to_owned())
+        );
+    }
+
+    #[test]
+    fn textual_scope_becomes_scope_description() {
+        // pipescan、autoruns 等插件把 scope 写成范围说明文字，不能让整次运行失败。
+        let envelope = envelope_from_value(
+            "pipescan",
+            synthetic_source(),
+            json!({"complete": true, "warnings": [], "scope": "仅报告经 Npfs 验证的命名管道"}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(envelope.scope.kind, "memory_image");
+        assert_eq!(
+            envelope.scope.description.as_deref(),
+            Some("仅报告经 Npfs 验证的命名管道")
+        );
+        assert_eq!(
+            envelope.scope.constraints.get("command_id"),
+            Some(&Value::String("pipescan".to_owned()))
         );
     }
 

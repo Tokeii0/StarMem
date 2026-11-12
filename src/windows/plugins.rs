@@ -229,78 +229,21 @@ pub fn list_dlls(
     per_process_limit: usize,
 ) -> Result<PluginReport<DllRecord>> {
     ensure!(per_process_limit > 0, "DLL 结果上限必须大于零");
-    let kernel_space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
-    let pcb = profile.field("Pcb")?.offset;
-    let peb = profile.field("Peb")?.offset;
-    let directory_table_base = profile
-        .type_field("_KPROCESS", "DirectoryTableBase")?
-        .offset;
-    let user_directory_table_base = profile
-        .type_layout("_KPROCESS")?
-        .fields
-        .get("UserDirectoryTableBase")
-        .map(|field| field.offset);
     let mut records = Vec::new();
     let mut warnings: Vec<String> = processes
         .warnings
         .iter()
         .map(|warning| format!("进程枚举/{}：{}", warning.kind, warning.message))
         .collect();
-
     for process in processes
         .processes
         .iter()
-        .filter(|process| pid_filter.is_none_or(|pid| process.pid == pid))
+        .filter(|p| pid_filter.is_none_or(|pid| p.pid == pid))
     {
-        let peb_address = match kernel_space.read_u64(process.eprocess + peb) {
-            Ok(0) => continue,
-            Ok(address) => address,
-            Err(error) => {
-                warnings.push(format!("PID {}：无法读取 PEB：{error:#}", process.pid));
-                continue;
-            }
-        };
-        let kernel_dtb = kernel_space
-            .read_u64(process.eprocess + pcb + directory_table_base)
-            .unwrap_or(0);
-        let user_dtb = user_directory_table_base
-            .and_then(|offset| kernel_space.read_u64(process.eprocess + pcb + offset).ok())
-            .unwrap_or(0);
-        let candidate_dtbs = [user_dtb, kernel_dtb];
-        let mut selected_dtb = candidate_dtbs
-            .into_iter()
-            .filter(|dtb| *dtb != 0)
-            .find(|dtb| {
-                X64AddressSpace::new(image, *dtb)
-                    .is_ok_and(|space| valid_process_peb(&space, peb_address))
-            });
-        if selected_dtb.is_none() {
-            selected_dtb = discover_process_dtb(image, peb_address);
-        }
-        let Some(selected_dtb) = selected_dtb else {
-            warnings.push(format!(
-                "PID {}：进程页表均未映射 PEB {peb_address:#x}",
-                process.pid
-            ));
-            continue;
-        };
-        let space = X64AddressSpace::new(image, selected_dtb)?;
-        match walk_process_dlls(
-            &space,
-            process.pid,
-            &process.name,
-            peb_address,
-            per_process_limit,
-        ) {
-            Ok((mut process_records, process_warning)) => {
-                records.append(&mut process_records);
-                if let Some(warning) = process_warning {
-                    warnings.push(warning);
-                }
-            }
-            Err(error) => warnings.push(format!("PID {}: {error:#}", process.pid)),
-        }
+        let report = list_process_dlls(image, kernel, profile, process, per_process_limit)?;
+        records.extend(report.records);
+        warnings.extend(report.warnings);
     }
     if let Some(pid) = pid_filter
         && !processes.processes.iter().any(|process| process.pid == pid)
@@ -314,7 +257,80 @@ pub fn list_dlls(
     })
 }
 
-fn walk_process_dlls(
+/// Reuses the same loader walker for an already identified guest process.
+/// A live caller validates EPROCESS / PID / CreateTime before and after use.
+pub(crate) fn list_process_dlls(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    process: &super::ProcessRecord,
+    limit: usize,
+) -> Result<PluginReport<DllRecord>> {
+    ensure!(limit > 0, "DLL 结果上限必须大于零");
+    let kernel_space = kernel.x64_address_space(image)?;
+    let pcb = profile.field("Pcb")?.offset;
+    let peb = profile.field("Peb")?.offset;
+    let directory_table_base = profile
+        .type_field("_KPROCESS", "DirectoryTableBase")?
+        .offset;
+    let user_directory_table_base = profile
+        .type_layout("_KPROCESS")?
+        .fields
+        .get("UserDirectoryTableBase")
+        .map(|field| field.offset);
+    let mut warnings = Vec::new();
+    let result = (|| -> Result<Vec<DllRecord>> {
+        let peb_address = kernel_space.read_u64(process.eprocess + peb)?;
+        if peb_address == 0 {
+            if image.is_live() {
+                warnings.push(format!("PID {}：没有可读取的用户态 PEB", process.pid));
+            }
+            return Ok(Vec::new());
+        }
+        let kernel_dtb = kernel_space
+            .read_u64(process.eprocess + pcb + directory_table_base)
+            .unwrap_or(0);
+        let user_dtb = user_directory_table_base
+            .and_then(|offset| kernel_space.read_u64(process.eprocess + pcb + offset).ok())
+            .unwrap_or(0);
+        let mut selected_dtb = [user_dtb, kernel_dtb]
+            .into_iter()
+            .filter(|dtb| *dtb != 0)
+            .find(|dtb| {
+                X64AddressSpace::new(image, *dtb)
+                    .is_ok_and(|space| valid_process_peb(&space, peb_address))
+            });
+        // A live read must not guess another process's address space by scanning
+        // all RAM when the selected EPROCESS no longer maps its PEB.
+        if selected_dtb.is_none() && !image.is_live() {
+            selected_dtb = discover_process_dtb(image, peb_address);
+        }
+        let selected_dtb =
+            selected_dtb.with_context(|| format!("进程页表均未映射 PEB {peb_address:#x}"))?;
+        let space = X64AddressSpace::new(image, selected_dtb)?;
+        let (records, warning) =
+            walk_process_dlls(&space, process.pid, &process.name, peb_address, limit)?;
+        warnings.extend(warning);
+        if image.is_live() && process.details.wow64 == Some(true) {
+            warnings.push("仅枚举原生 x64 加载器；WOW64 的 32 位模块尚未覆盖".into());
+        }
+        Ok(records)
+    })();
+    let records = match result {
+        Ok(records) => records,
+        Err(error) => {
+            warnings.push(format!("PID {}：{error:#}", process.pid));
+            Vec::new()
+        }
+    };
+    Ok(PluginReport {
+        complete: warnings.is_empty(),
+        records,
+        warnings,
+    })
+}
+
+pub(crate) fn walk_process_dlls(
     space: &X64AddressSpace<'_>,
     pid: u64,
     process: &str,
@@ -421,7 +437,9 @@ fn discover_vad_root(
     };
     let mut best = (score(reported_root), reported_root);
     for offset in (0x300..eprocess_size.min(0x1000)).step_by(8) {
-        let Ok(candidate) = space.read_u64(eprocess + offset) else {
+        let Ok(candidate) =
+            checked_vad_field(eprocess, offset).and_then(|address| space.read_u64(address))
+        else {
             continue;
         };
         if !is_kernel_pointer(candidate) {
@@ -458,10 +476,10 @@ fn score_vad_tree(
         if score == SCORE_LIMIT || !visited.insert(node) {
             continue;
         }
-        let Some(start) = read_vpn(space, node, starting_vpn_offset, starting_high_offset) else {
+        let Ok(start) = read_vpn(space, node, starting_vpn_offset, starting_high_offset) else {
             return score;
         };
-        let Some(end) = read_vpn(space, node, ending_vpn_offset, ending_high_offset) else {
+        let Ok(end) = read_vpn(space, node, ending_vpn_offset, ending_high_offset) else {
             return score;
         };
         if start < minimum || start > maximum || end < start || end > MAX_USER_VPN {
@@ -472,7 +490,12 @@ fn score_vad_tree(
             (left_offset, minimum, start.saturating_sub(1)),
             (right_offset, start.saturating_add(1), maximum),
         ] {
-            let child = space.read_u64(node + child_offset).unwrap_or(0) & !7;
+            let Ok(child) =
+                checked_vad_field(node, child_offset).and_then(|address| space.read_u64(address))
+            else {
+                return score;
+            };
+            let child = child & !7;
             if child == 0 {
                 continue;
             }
@@ -490,12 +513,14 @@ fn read_vpn(
     node: u64,
     low_offset: u64,
     high_offset: Option<u64>,
-) -> Option<u64> {
-    let low = u64::from(read_u32(space, node + low_offset).ok()?);
-    let high = high_offset
-        .and_then(|offset| read_u8(space, node + offset).ok())
-        .map_or(0, |value| u64::from(value) << 32);
-    Some(low | high)
+) -> Result<u64> {
+    let low = u64::from(read_u32(space, checked_vad_field(node, low_offset)?)?);
+    // A missing high byte is unknown, not zero: guessing it changes the range.
+    let high = match high_offset {
+        Some(offset) => u64::from(read_u8(space, checked_vad_field(node, offset)?)?) << 32,
+        None => 0,
+    };
+    Ok(low | high)
 }
 
 pub fn list_vads(
@@ -505,9 +530,29 @@ pub fn list_vads(
     pid: u64,
     limit: usize,
 ) -> Result<PluginReport<VadRecord>> {
+    list_vads_cancellable(
+        image,
+        kernel,
+        profile,
+        pid,
+        limit,
+        &CancellationToken::new(),
+    )
+}
+
+pub fn list_vads_cancellable(
+    image: &MemoryImage,
+    kernel: &WindowsKernelContext,
+    profile: &KernelProfile,
+    pid: u64,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<PluginReport<VadRecord>> {
     ensure!(limit > 0, "VAD 结果上限必须大于零");
+    cancellation.check_cancelled()?;
     let space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
+    cancellation.check_cancelled()?;
     let process = processes
         .processes
         .iter()
@@ -539,7 +584,9 @@ pub fn list_vads(
             .or_else(|_| profile.type_field("_MMVAD_SHORT", "RightChild"))?
             .offset;
         (
-            balanced_root + root_child,
+            balanced_root
+                .checked_add(root_child)
+                .context("VAD 根字段偏移溢出")?,
             profile.type_field("_MMVAD_SHORT", "LeftChild")?.offset,
             profile.type_field("_MMVAD_SHORT", "RightChild")?.offset,
             0,
@@ -572,7 +619,8 @@ pub fn list_vads(
     let (vad_type_position, vad_type_length) = vad_flag_layout(profile, "VadType", 4, 3);
     let (protection_position, protection_length) = vad_flag_layout(profile, "Protection", 7, 5);
     let (private_position, private_length) = vad_flag_layout(profile, "PrivateMemory", 20, 1);
-    let mut root = space.read_u64(process.eprocess + vad_root + root_offset)?;
+    let root_field = checked_vad_field(process.eprocess, vad_root)?;
+    let mut root = space.read_u64(checked_vad_field(root_field, root_offset)?)?;
     if modern_vad_node.is_some() {
         root = discover_vad_root(
             &space,
@@ -596,8 +644,9 @@ pub fn list_vads(
     let mut records = Vec::new();
     let mut warnings = Vec::new();
     while let Some(tree_node) = stack.pop() {
-        if records.len() == limit {
-            warnings.push(format!("VAD 结果达到 {limit} 条上限"));
+        cancellation.check_cancelled()?;
+        if visited.len() == limit {
+            push_warning_limited(&mut warnings, format!("VAD 遍历达到 {limit} 个节点上限"));
             break;
         }
         if !visited.insert(tree_node) {
@@ -612,31 +661,36 @@ pub fn list_vads(
             }
         };
         let parsed = (|| -> Result<VadRecord> {
-            let start_vpn = u64::from(read_u32(&space, vad + starting_vpn)?)
-                | starting_high
-                    .and_then(|offset| read_u8(&space, vad + offset).ok())
-                    .map_or(0, |high| u64::from(high) << 32);
-            let end_vpn = u64::from(read_u32(&space, vad + ending_vpn)?)
-                | ending_high
-                    .and_then(|offset| read_u8(&space, vad + offset).ok())
-                    .map_or(0, |high| u64::from(high) << 32);
+            let start_vpn = read_vpn(&space, vad, starting_vpn, starting_high)?;
+            let end_vpn = read_vpn(&space, vad, ending_vpn, ending_high)?;
             ensure!(end_vpn >= start_vpn, "VAD 结束地址早于起始地址");
             // _MMVAD_FLAGS is 64-bit on Windows 7 (Protection begins at bit 56)
             // and 32-bit on newer kernels. Reading the containing 64-bit union
             // handles both layouts without hard-coding an OS version.
-            let flags = space.read_u64(vad + flags_offset)?;
+            let flags = space.read_u64(checked_vad_field(vad, flags_offset)?)?;
             let protection = extract_u64_bits(flags, protection_position, protection_length) as u8;
             let private_memory = extract_u64_bits(flags, private_position, private_length) != 0;
             let file = if private_memory {
                 None
             } else {
-                vad_file_name(
+                match vad_file_name(
                     &space,
                     vad,
                     file_object_offset,
                     subsection_path,
                     file_name_offset,
-                )
+                ) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        push_warning_limited(
+                            &mut warnings,
+                            format!(
+                                "VAD {vad:#x} 的文件关联无法解析，保留区间且文件未知：{error:#}"
+                            ),
+                        );
+                        None
+                    }
+                }
             };
             Ok(VadRecord {
                 pid,
@@ -656,12 +710,13 @@ pub fn list_vads(
             Err(error) => warnings.push(format!("无法解析 VAD {vad:#x}：{error:#}")),
         }
         for child_offset in [right, left] {
-            match space.read_u64(tree_node + child_offset) {
+            match checked_vad_field(tree_node, child_offset)
+                .and_then(|address| space.read_u64(address))
+            {
                 Ok(child) if child != 0 => stack.push(child),
                 Ok(_) => {}
                 Err(error) => warnings.push(format!(
-                    "无法读取 {:#x} 处的 VAD 子节点：{error:#}",
-                    tree_node + child_offset
+                    "无法读取 VAD {tree_node:#x} 的子节点字段 +{child_offset:#x}：{error:#}"
                 )),
             }
         }
@@ -2146,38 +2201,69 @@ fn extract_u64_bits(value: u64, position: u8, length: u8) -> u64 {
     (value >> position) & mask
 }
 
+fn checked_vad_field(object: u64, offset: u64) -> Result<u64> {
+    ensure!(
+        object >= 0xffff_8000_0000_0000 && object & 7 == 0,
+        "VAD 关联中存在无效内核指针 {object:#x}"
+    );
+    object
+        .checked_add(offset)
+        .with_context(|| format!("VAD 关联字段地址溢出：{object:#x} + {offset:#x}"))
+}
+
 fn vad_file_name(
     space: &X64AddressSpace<'_>,
     vad: u64,
     direct_file_object: Option<u64>,
     subsection_path: Option<(u64, u64, u64)>,
     file_name_offset: u64,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let mut candidates = Vec::with_capacity(2);
-    if let Some(offset) = direct_file_object
-        && let Ok(pointer) = space.read_u64(vad + offset)
-    {
-        candidates.push(pointer & !0xf);
+    if let Some(offset) = direct_file_object {
+        candidates.push(checked_vad_field(vad, offset).and_then(|address| space.read_u64(address)));
     }
-    if let Some((subsection_offset, control_area_offset, file_pointer_offset)) = subsection_path
-        && let Ok(subsection) = space.read_u64(vad + subsection_offset)
-        && subsection != 0
-        && let Ok(control_area) = space.read_u64((subsection & !0xf) + control_area_offset)
-        && control_area != 0
-        && let Ok(file_reference) = space.read_u64((control_area & !0xf) + file_pointer_offset)
-    {
-        // _CONTROL_AREA.FilePointer is an _EX_FAST_REF. Its low four bits are
-        // a reference count and must not be treated as part of the pointer.
-        candidates.push(file_reference & !0xf);
+    if let Some((subsection_offset, control_area_offset, file_pointer_offset)) = subsection_path {
+        candidates.push((|| -> Result<u64> {
+            let subsection = space.read_u64(checked_vad_field(vad, subsection_offset)?)?;
+            if subsection == 0 {
+                return Ok(0);
+            }
+            // Subsection and ControlArea are ordinary pointers, not EX_FAST_REFs.
+            // Do not round an eight-byte-aligned pointer down to another object.
+            let control_area =
+                space.read_u64(checked_vad_field(subsection, control_area_offset)?)?;
+            if control_area == 0 {
+                return Ok(0);
+            }
+            space.read_u64(checked_vad_field(control_area, file_pointer_offset)?)
+        })());
     }
-    candidates.into_iter().find_map(|file_object| {
-        if file_object >> 48 != 0xffff {
-            return None;
+    ensure!(!candidates.is_empty(), "符号中缺少 VAD 文件关联字段");
+    let mut first_error = None;
+    for candidate in candidates {
+        let result = candidate.and_then(|reference| {
+            // _CONTROL_AREA.FilePointer is an _EX_FAST_REF. Only the file
+            // reference has four low reference-count bits to remove.
+            if reference == 0 {
+                return Ok(None);
+            }
+            let file_object = reference & !0xf;
+            let descriptor = checked_vad_field(file_object, file_name_offset)?;
+            let name = read_unicode_string(space, descriptor, 32 * 1024)?;
+            Ok((!name.is_empty()).then_some(name))
+        });
+        match result {
+            Ok(Some(name)) => return Ok(Some(name)),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
-        read_unicode_string(space, file_object + file_name_offset, 32 * 1024)
-            .ok()
-            .filter(|name| !name.is_empty())
-    })
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 fn handle_entry_address(space: &X64AddressSpace<'_>, table_code: u64, handle: u32) -> Result<u64> {
@@ -2549,6 +2635,10 @@ fn protection_name(protection: u8) -> &'static str {
     ];
     BASE[usize::from(protection & 7)]
 }
+
+#[cfg(test)]
+#[path = "plugins/vad_tests.rs"]
+mod vad_tests;
 
 #[cfg(test)]
 mod handle_owner_tests {

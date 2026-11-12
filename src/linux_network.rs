@@ -125,13 +125,14 @@ struct ExactLinuxSocketProfile {
     unix_path_capacity: usize,
     task_nsproxy: u64,
     nsproxy_net_ns: u64,
-    possible_net_net: u64,
-    net_ns: u64,
-    ns_common_inum: u64,
+    socket_net_field: &'static str,
+    net_inum: u64,
+    net_inum_field: &'static str,
 }
 
 impl ExactLinuxSocketProfile {
     fn from_isf(isf: &crate::linux_symbols::LinuxIsf) -> Result<Self> {
+        let namespace = SocketNamespaceLayout::from_isf(isf)?;
         let sock_common = isf.field_offset("sock", "__sk_common")?;
         let common = |field: &str| -> Result<u64> {
             sock_common
@@ -157,7 +158,7 @@ impl ExactLinuxSocketProfile {
             skc_family: common("skc_family")?,
             skc_state: common("skc_state")?,
             skc_bound_dev_if: common("skc_bound_dev_if")?,
-            skc_net: common("skc_net")?,
+            skc_net: common(namespace.socket_net_field)?,
             skc_v6_daddr: common("skc_v6_daddr")?,
             skc_v6_rcv_saddr: common("skc_v6_rcv_saddr")?,
             sock_type: IntegerField::from_isf(isf, "sock", "sk_type")?,
@@ -172,9 +173,9 @@ impl ExactLinuxSocketProfile {
                 .context("sockaddr_un.sun_path 长度无效")?,
             task_nsproxy: isf.field_offset("task_struct", "nsproxy")?,
             nsproxy_net_ns: isf.field_offset("nsproxy", "net_ns")?,
-            possible_net_net: isf.field_offset("possible_net_t", "net")?,
-            net_ns: isf.field_offset("net", "ns")?,
-            ns_common_inum: isf.field_offset("ns_common", "inum")?,
+            socket_net_field: namespace.socket_net_field,
+            net_inum: namespace.net_inum,
+            net_inum_field: namespace.net_inum_field,
         };
         ensure!(
             profile.socket_alloc_vfs_inode > 0,
@@ -231,9 +232,9 @@ impl ExactLinuxSocketProfile {
             unix_path_capacity: 108,
             task_nsproxy,
             nsproxy_net_ns: 0x28,
-            possible_net_net: 0,
-            net_ns: 0x78,
-            ns_common_inum: 0x10,
+            socket_net_field: "skc_net.net",
+            net_inum: 0x88,
+            net_inum_field: "ns.inum",
         };
         Some(match banner {
             UBUNTU_4_13_0_36_XENIAL => common(
@@ -295,7 +296,6 @@ impl ExactLinuxSocketProfile {
             ("sock_common.skc_family", self.skc_family),
             ("sock_common.skc_state", self.skc_state),
             ("sock_common.skc_bound_dev_if", self.skc_bound_dev_if),
-            ("sock_common.skc_net", self.skc_net),
             ("sock_common.skc_v6_daddr", self.skc_v6_daddr),
             ("sock_common.skc_v6_rcv_saddr", self.skc_v6_rcv_saddr),
             ("sock.sk_socket", self.sock_socket),
@@ -306,12 +306,16 @@ impl ExactLinuxSocketProfile {
             ("sockaddr_un.sun_path", self.sockaddr_un_sun_path),
             ("task_struct.nsproxy", self.task_nsproxy),
             ("nsproxy.net_ns", self.nsproxy_net_ns),
-            ("possible_net_t.net", self.possible_net_net),
-            ("net.ns", self.net_ns),
-            ("ns_common.inum", self.ns_common_inum),
         ]
         .into_iter()
         .map(|(name, offset)| (name.to_owned(), offset))
+        .chain([
+            (
+                format!("sock_common.{}", self.socket_net_field),
+                self.skc_net,
+            ),
+            (format!("net.{}", self.net_inum_field), self.net_inum),
+        ])
         .collect();
         let integer_fields = [
             ("socket.state", self.socket_state),
@@ -844,12 +848,51 @@ fn read_unix_name(
     Ok((end > 0).then(|| display_unix_bytes(&bytes[..end])))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SocketNamespaceLayout {
+    socket_net_field: &'static str,
+    net_inum: u64,
+    net_inum_field: &'static str,
+}
+
+impl SocketNamespaceLayout {
+    fn from_isf(isf: &crate::linux_symbols::LinuxIsf) -> Result<Self> {
+        // Before possible_net_t/ns_common, these were struct net *skc_net
+        // and net.proc_inum. Choose by the ISF types, never by a guessed offset.
+        let socket_net_field = if isf
+            .field_pointer_target_type("sock_common", "skc_net")
+            .is_ok_and(|target| target == "net")
+        {
+            "skc_net"
+        } else {
+            "skc_net.net"
+        };
+        ensure!(
+            isf.field_pointer_target_type("sock_common", socket_net_field)? == "net"
+                && isf.field_size("sock_common", socket_net_field)? == 8,
+            "sock_common 网络命名空间字段不是 64 位 struct net 指针"
+        );
+        let net_inum_field = if isf.optional_field_offset("net", "ns")?.is_some() {
+            "ns.inum"
+        } else {
+            "proc_inum"
+        };
+        let (net_inum, width) = isf.field_scalar_layout("net", net_inum_field)?;
+        ensure!(width == 4, "网络命名空间 inode 字段不是 32 位整数");
+        Ok(Self {
+            socket_net_field,
+            net_inum,
+            net_inum_field,
+        })
+    }
+}
+
 fn read_socket_net_namespace(
     space: &LinuxX64AddressSpace<'_>,
     profile: ExactLinuxSocketProfile,
     sock: u64,
 ) -> Result<Option<u32>> {
-    let net = space.read_u64(sock + profile.skc_net + profile.possible_net_net)?;
+    let net = space.read_u64(sock + profile.skc_net)?;
     read_net_namespace(space, profile, net)
 }
 
@@ -876,9 +919,7 @@ fn read_net_namespace(
         return Ok(None);
     }
     ensure!(is_kernel_pointer(net), "struct net 指针无效");
-    Ok(Some(
-        space.read_u32(net + profile.net_ns + profile.ns_common_inum)?,
-    ))
+    Ok(Some(space.read_u32(net + profile.net_inum)?))
 }
 
 fn read_unsigned(space: &LinuxX64AddressSpace<'_>, address: u64, width: u8) -> Result<u64> {
@@ -1059,6 +1100,46 @@ fn format_address(address: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_layout_supports_legacy_pointers_and_named_wrappers() {
+        let mut types = serde_json::json!({
+            "sock_common": { "size": 112, "fields": {
+                "skc_net": { "offset": 48, "type": { "kind": "pointer", "subtype": { "kind": "struct", "name": "net" } } }
+            } },
+            "net": { "size": 256, "fields": {
+                "proc_inum": { "offset": 72, "type": { "kind": "base", "name": "unsigned int" } }
+            } }
+        });
+        let legacy = crate::linux_symbols::test_isf(types.clone());
+        let layout = SocketNamespaceLayout::from_isf(&legacy).unwrap();
+        assert_eq!(layout.socket_net_field, "skc_net");
+        assert_eq!(layout.net_inum, 72);
+        assert_eq!(layout.net_inum_field, "proc_inum");
+
+        types["sock_common"]["fields"]["skc_net"]["type"] =
+            serde_json::json!({"kind": "struct", "name": "possible_net_t"});
+        types["possible_net_t"] = serde_json::json!({"size": 8, "fields": {
+            "net": {"offset": 0, "type": {"kind": "pointer", "subtype": {"kind": "struct", "name": "net"}}}
+        }});
+        types["net"]["fields"] = serde_json::json!({"ns": {"offset": 120, "type": {"kind": "struct", "name": "ns_common"}}});
+        types["ns_common"] = serde_json::json!({"size": 24, "fields": {
+            "inum": {"offset": 16, "type": {"kind": "base", "name": "unsigned int"}}
+        }});
+        let wrapped = crate::linux_symbols::test_isf(types.clone());
+        let layout = SocketNamespaceLayout::from_isf(&wrapped).unwrap();
+        assert_eq!(layout.socket_net_field, "skc_net.net");
+        assert_eq!(
+            wrapped
+                .field_offset("sock_common", layout.socket_net_field)
+                .unwrap(),
+            48
+        );
+        assert_eq!(layout.net_inum, 136);
+        assert_eq!(layout.net_inum_field, "ns.inum");
+        types["ns_common"]["fields"]["inum"]["type"]["name"] = "long unsigned int".into();
+        assert!(SocketNamespaceLayout::from_isf(&crate::linux_symbols::test_isf(types)).is_err());
+    }
 
     #[test]
     fn exact_profiles_are_bound_to_full_banners() {

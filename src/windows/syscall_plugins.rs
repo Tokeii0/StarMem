@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::pe_plugins::read_pe_exports;
 use super::plugins::{VadRecord, list_dlls, list_vads};
 use super::{ProcessRecord, WindowsKernelContext, list_processes};
-use crate::address::{VirtualAddressRegion, VirtualMapping, X64AddressSpace};
+use crate::address::{VirtualAddressRegion, VirtualMapping, WindowsAddressSpace, X64AddressSpace};
 use crate::image::MemoryImage;
 use crate::profile::KernelProfile;
 
@@ -423,6 +423,7 @@ pub fn compare_ntdll_syscalls(
             complete = false;
             continue;
         };
+        let space = WindowsAddressSpace::X64(space);
         let exports = match read_pe_exports(&space, dll.base) {
             Ok(exports) => exports,
             Err(error) => {
@@ -529,6 +530,7 @@ pub fn detect_etw_patches(
             complete = false;
             continue;
         };
+        let space = WindowsAddressSpace::X64(space);
         let exports = match read_pe_exports(&space, dll.base) {
             Ok(exports) => exports,
             Err(error) => {

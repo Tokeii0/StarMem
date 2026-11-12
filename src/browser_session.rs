@@ -121,6 +121,8 @@ pub struct BrowserSessionTiming {
 
 #[derive(Debug, Serialize)]
 pub struct BrowserSessionReport {
+    pub database_sources: Vec<crate::browser_artifacts::BrowserDatabaseSource>,
+    pub page_candidates: Vec<crate::browser_artifacts::BrowserPageCandidate>,
     pub sessions: Vec<BrowserSessionRecord>,
     pub browser_processes: Vec<BrowserProcessRecord>,
     pub cookies: Vec<BrowserCookieRecord>,
@@ -339,6 +341,8 @@ where
     };
 
     Ok(BrowserSessionReport {
+        database_sources: artifact_report.database_sources,
+        page_candidates: artifact_report.page_candidates,
         sessions,
         browser_processes,
         cookies: cookie_report.records,
@@ -396,7 +400,13 @@ fn browser_process_context(session: &AnalysisSession) -> Result<BrowserProcessCo
             .details
             .user_directory_table_base
             .or(process.details.directory_table_base)
-            .map(|value| value & 0x000f_ffff_ffff_f000)
+            .map(|value| {
+                if session.kernel().is_x86_pae() {
+                    value & 0xffff_ffe0
+                } else {
+                    value & 0x000f_ffff_ffff_f000
+                }
+            })
             .filter(|value| *value != 0)
         {
             let owner = DownloadOwner {
@@ -445,6 +455,9 @@ fn map_download_owners(
     address_spaces: &mut Vec<AddressSpaceCandidate>,
     process_space_limit: usize,
 ) -> (bool, usize, Vec<String>) {
+    if session.kernel().is_x86_pae() {
+        return (false, 0, vec!["x86 PAE 下载文本保留为未归属线索；进程反查尚未覆盖，未使用 x64 页表解释 x86 地址空间".to_owned()]);
+    }
     let mut complete = true;
     let mut warnings = Vec::new();
     let targets = records

@@ -153,6 +153,19 @@ pub(super) fn analyze(
                 let mut row = json!({"task": address, "task_hex": format!("{address:#018x}"), "pid": pid, "tgid": tgid,
                     "name": inline_string(&m, address, "task_struct", "comm")?, "ppid": task.ppid});
                 match options.module.as_str() {
+                    "cwd" => {
+                        let directory = crate::linux_process::process_current_directory(
+                            session.image(),
+                            session.kernel(),
+                            address,
+                        )?;
+                        row["fs"] = json!(directory.fs);
+                        row["mount"] = json!(directory.mount);
+                        row["dentry"] = json!(directory.dentry);
+                        row["path"] = json!(directory.path);
+                        row["path_semantics"] = json!(directory.path_semantics);
+                        report.push(row);
+                    }
                     "perf-events" => perf_events(&m, address, row, options, cancel, &mut report)?,
                     "callstack" => callstack(
                         &m,

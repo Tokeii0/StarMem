@@ -209,6 +209,18 @@ pub fn netstat(
     let pdb = symbol_store
         .resolve(&codeview)
         .with_context(|| format!("无法解析精确的 tcpip PDB {}", codeview.symbol_key))?;
+    if image.is_live() {
+        let mut symbols = pdb::PDB::open(std::fs::File::open(&pdb)?)?;
+        let guid = symbols.pdb_information()?.guid.to_string();
+        let age = symbols
+            .debug_information()?
+            .age()
+            .context("tcpip PDB 缺少 DBI age")?;
+        ensure!(
+            guid.eq_ignore_ascii_case(&codeview.guid) && age == codeview.age,
+            "tcpip PDB 与实时模块 CodeView 不匹配"
+        );
+    }
     let globals = read_pdb_symbol_rvas(
         &pdb,
         &[

@@ -92,6 +92,7 @@ use starmem::windows::files::DumpSource;
 use starmem::windows::gdi_bitmap::GdiBitmapOptions;
 use starmem::windows::injected_regions::InjectedRegionOptions;
 use starmem::windows::logon_plugins::LogonSessionOptions;
+use starmem::windows::mailslot_plugins::MailslotOptions;
 use starmem::windows::open_files::{OpenFileOptions, scan_open_files};
 use starmem::windows::pipe_plugins::PipeScanOptions;
 use starmem::windows::plugins::find_handle_owners;
@@ -123,6 +124,16 @@ static EVIDENCE_OUTPUT_CONTEXT: OnceLock<EvidenceOutputContext> = OnceLock::new(
 static OUTPUT_POLICY: OnceLock<OutputPolicy> = OnceLock::new();
 static IMAGE_OPEN_OPTIONS: OnceLock<ImageOpenOptions> = OnceLock::new();
 static WINDOWS_SYMBOL_IDENTITY: OnceLock<Mutex<Option<SymbolIdentity>>> = OnceLock::new();
+static SHOW_WARNINGS: OnceLock<bool> = OnceLock::new();
+
+// Only terminal diagnostics are gated. Reports retain their warning evidence.
+macro_rules! warningln {
+    ($($argument:tt)*) => {
+        if SHOW_WARNINGS.get().copied().unwrap_or(false) {
+            eprintln!($($argument)*);
+        }
+    };
+}
 
 /// CLI-local wrapper that records the exact Windows symbol/profile identity consumed by every
 /// session. The library type remains unchanged; `Deref` preserves its complete public API.
@@ -130,11 +141,19 @@ struct AnalysisSession(CoreAnalysisSession);
 
 impl AnalysisSession {
     fn open(path: impl AsRef<Path>, options: SessionOptions) -> Result<Self> {
+        ensure!(
+            options.symbol_store.linux_system_map().is_none(),
+            "System.map 只适用于 Linux 分析"
+        );
         let session = CoreAnalysisSession::open(path, options)?;
         Self::from_core(session)
     }
 
     fn from_image(image: MemoryImage, options: SessionOptions) -> Result<Self> {
+        ensure!(
+            options.symbol_store.linux_system_map().is_none(),
+            "System.map 只适用于 Linux 分析"
+        );
         let session = CoreAnalysisSession::from_image(image, options)?;
         Self::from_core(session)
     }
@@ -288,6 +307,10 @@ struct Cli {
     #[arg(long, global = true)]
     no_progress: bool,
 
+    /// 显示终端警告；默认隐藏，JSON/CSV 报告始终保留警告记录。
+    #[arg(long, global = true)]
+    show_warnings: bool,
+
     /// 允许替换普通输出；任何受保护输入及目录中的无关文件仍不可覆盖。
     #[arg(long, global = true)]
     force: bool,
@@ -333,6 +356,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 无外部调试符号的基础系统信息；字段保留来源、缺失及估算说明。
+    #[command(name = "symbolless.system-info")]
+    SymbollessSystemInfo { image: PathBuf },
+    /// 无符号进程上下文：恢复原生 AMD64 命令行、映像路径及环境变量。
+    #[command(name = "symbolless.process-context")]
+    SymbollessProcessContext(SymbollessContextArgs),
+    /// 无符号进程 DLL：逐进程恢复原生 AMD64 加载器模块链，保留缺页和核验状态。
+    #[command(name = "symbolless.process-modules")]
+    SymbollessProcessModules(SymbollessModulesArgs),
+    /// 无外部调试符号的基础进程分析（实验性，仅手动执行）。
+    #[command(name = "symbolless.pslist")]
+    SymbollessProcesses(SymbollessProcessArgs),
+    /// 无外部调试符号的文件对象扫描（实验性，仅手动执行）。
+    #[command(name = "symbolless.filescan")]
+    SymbollessFiles(SymbollessFileArgs),
+    /// 从已核验的无符号 FILE_OBJECT 恢复驻留内容并保存范围说明。
+    #[command(name = "symbolless.dumpfile")]
+    SymbollessDump(SymbollessDumpArgs),
+    /// 从显式选择的 Hive 文件对象解析注册表与离线凭据；仅手动执行。
+    #[command(name = "symbolless.registry")]
+    SymbollessRegistry(SymbollessRegistryArgs),
     /// 显示当前二进制、源码和公共契约的可复现构建身份。
     #[command(name = "build-info")]
     BuildInfo,
@@ -373,22 +417,37 @@ enum Command {
     /// 一次物理扫描 ASCII/UTF-8 与 UTF-16LE 字面字符串，并反查活动进程归属。
     #[command(name = "windows.process-string", visible_alias = "process-string")]
     WindowsProcessString(ProcessStringArgs),
+    /// 从指定物理字节的 PFN 和原型 PTE 反查数据节文件对象与文件内偏移。
+    #[command(name = "windows.phys2file")]
+    WindowsPhys2file(PhysicalFileArgs),
     /// 在已采集的物理内存范围中扫描精确字节序列。
     Scan(ScanArgs),
+    /// 根据显式 macOS 符号与驻留内核链分析系统、进程和文件（OS X 10.8–10.11，x86-64）。
+    #[command(name = "macos.ir")]
+    MacosIr(MacosIrArgs),
+    /// 按 vnode/UBC/vm_object 归属恢复 macOS 驻留文件页；缺页使用 .partial 产物。
+    #[command(name = "macos.dumpfile")]
+    MacosDumpfile(MacosDumpfileArgs),
     /// 扫描下载命令、URL、远端 IP 和可疑载荷名称。
     Downloadscan(DownloadScanArgs),
     /// 恢复浏览器进程内明文 Cookie，并解析驻留的 Chromium、Firefox 和旧式 Cookie 文件。
     Cookiescan(CookieScanArgs),
-    /// 解析 Window Station、格式数组、句柄和数据块，恢复活动剪切板内容。
+    /// 恢复活动剪贴板格式及经符号布局验证的 TextInputHost 驻留历史。
     Clipboardscan(ClipboardScanArgs),
     /// 扫描邮箱、URL、IPv4、Windows 路径、命令及用户指定的进程文本残留。
     Residualscan(ResidualScanArgs),
     /// 从微信进程地址空间恢复 SQLCipher 数据库密钥候选及 salt。
     Wechatscan(WechatScanArgs),
-    /// 聚合浏览器进程、Cookie、下载、History 与 Login Data，重建可验证的浏览器会话证据。
+    /// 恢复 QQNT 进程中的消息片段、联系人资料、附件传输和客户端日志。
+    Qqscan(QqScanArgs),
+    /// 从微信驻留 WCDB 缓存恢复聊天正文、发送者、联系人和会话摘要。
+    WechatChat(WechatChatArgs),
+    /// 聚合浏览器进程、Cookie、Chromium/Firefox 历史、下载与账号元数据，重建可验证的会话证据。
     BrowserSession(BrowserSessionArgs),
-    /// 从 Chromium History 数据库恢复 URL 访问历史。
+    /// 从 Chromium History 与 Firefox places.sqlite 恢复 URL 概要及逐次访问事件。
     BrowserHistory(BrowserHistoryArgs),
+    /// 关联浏览器窗口、驻留 URL 与 Session 片段，保留页面和标签页线索的来源。
+    BrowserPages(BrowserPagesArgs),
     /// 恢复浏览器 Cookie、下载 URL 与会话中的域名证据，并关联进程归属。
     Dnsscan(BrowserSessionArgs),
     /// 扫描账户创建、删除、改密、启停及本地组变更痕迹。
@@ -400,7 +459,7 @@ enum Command {
         #[command(subcommand)]
         command: SymbolCommand,
     },
-    /// 从内核 PDB 生成精简的 _EPROCESS 字段配置。
+    /// 从内核 PDB 生成精简符号配置；.ssym 输出为实验性二进制，其余为 JSON。
     Profile {
         pdb: PathBuf,
         #[arg(short, long)]
@@ -441,6 +500,9 @@ enum Command {
     /// 按 VMA 将 Linux 进程驻留虚拟内存导出到目录；缺页结果保留为 .partial。
     #[command(name = "linux.proc.dump", visible_alias = "linux-proc-dump")]
     LinuxProcDump(LinuxProcDumpArgs),
+    /// 提取 Linux 进程堆、栈及可选匿名可写映射中驻留页面的 UTF-8/UTF-16LE 字符串，并给出虚拟地址。
+    #[command(name = "linux.proc.strings", visible_alias = "linux-proc-strings")]
+    LinuxProcStrings(LinuxProcStringsArgs),
     /// 从活动 Bash 堆中恢复与 #epoch 时间戳关联的 HIST_ENTRY 命令。
     #[command(name = "linux.bash", visible_alias = "linux-bash")]
     LinuxBash(LinuxBashArgs),
@@ -518,6 +580,9 @@ enum Command {
     GuiWindows(PluginArgs),
     /// 恢复每个具有非空标题的 GUI 窗口，并关联进程、桌面和父窗口。
     Windowtitles(PluginArgs),
+    /// 按会话恢复最近最多 64 个鼠标位置，保留环内顺序、时钟限制和原始地址。
+    #[command(name = "mouse-history")]
+    MouseHistory(PluginArgs),
     /// 从进程 VAD 中验证标准 DIB 结构，并将完整驻留像素无损导出为 BMP。
     #[command(name = "gdi-bitmap")]
     GdiBitmap(GdiBitmapArgs),
@@ -616,6 +681,8 @@ enum Command {
     WindowsOpenFiles(OpenFileArgs),
     /// 扫描由 NPFS 结构链验证的命名管道，并关联活动进程句柄。
     Pipescan(PipeScanArgs),
+    /// 验证 MSFS mailslot 端点、关联进程句柄，并恢复支持布局的队列消息。
+    Mailslots(MailslotArgs),
     /// 从驻留 FILE_OBJECT 恢复并解析 Windows Prefetch 执行记录。
     Prefetchscan(PrefetchScanArgs),
     /// 扫描 TCP/UDP 池分配并恢复网络端点。
@@ -661,6 +728,23 @@ enum Command {
     /// 聚合 WPS 最近文件逐项时间与 Explorer RecentDocs MRU 顺序。
     #[command(name = "windows.recent-files", visible_alias = "recent-files")]
     WindowsRecentFiles(WindowsRecentFilesArgs),
+    /// 检测 BitLocker 组件、恢复密钥文件线索与驻留文本，不推定卷状态。
+    Bitlocker(ApplicationArgs),
+    /// 检测 VeraCrypt 进程、驱动、容器候选与挂载历史配置。
+    Veracrypt(ApplicationArgs),
+    /// 分析向日葵/AweSun 进程、网络及驻留配置与日志。
+    Sunlogin(ApplicationArgs),
+    /// 分析 AnyDesk 进程、网络、本机标识及连接请求日志。
+    Anydesk(ApplicationArgs),
+    /// 分析 WPS 进程、网络、最近文档及驻留配置与日志。
+    Wps(ApplicationArgs),
+    /// 火绒报毒、隔离与驻留日志分析。
+    Huorong(ApplicationArgs),
+    /// AI 客户端本地会话与进程内存分析。
+    AiChat(ApplicationArgs),
+    /// 分析前台焦点、编辑控件、输入法、剪贴板、浏览器会话、Explorer 与通知痕迹。
+    #[command(name = "windows.interaction")]
+    WindowsInteraction(WindowsInteractionArgs),
     /// 聚合同一物理 USB 的总线、存储与辅助接口并解释连接时间。
     #[command(name = "usb-history")]
     UsbHistory(UsbHistoryArgs),
@@ -717,10 +801,52 @@ struct ScanArgs {
     /// 精确的十六进制字节，例如 "4d 5a 90 00"。
     #[arg(long, conflicts_with = "text")]
     hex: Option<String>,
+    /// 文本模式的内存编码；十六进制模式保留原始字节语义。
+    #[arg(long, default_value = "utf8", value_parser = ["utf8", "utf16le"])]
+    encoding: String,
+    /// 每个命中前后各读取的原始上下文字节；0 关闭，最多 4096。
+    #[arg(long, default_value_t = 0)]
+    context_bytes: usize,
     #[arg(long, default_value_t = 100)]
     limit: usize,
     #[arg(long, default_value_t = 64)]
     chunk_mib: usize,
+}
+
+#[derive(Args)]
+struct MacosIrArgs {
+    image: PathBuf,
+    #[arg(long)]
+    profile: PathBuf,
+    #[arg(long, default_value = "info", value_parser = ["info", "processes", "files"])]
+    module: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, default_value_t = 100_000)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct PhysicalFileArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    /// 物理地址（不是镜像文件偏移），支持十进制与 0x 十六进制。
+    #[arg(long)]
+    physical: String,
+}
+
+#[derive(Args)]
+struct MacosDumpfileArgs {
+    image: PathBuf,
+    #[arg(long)]
+    profile: PathBuf,
+    #[arg(long, value_parser = parse_integer)]
+    address: u64,
+    #[arg(short, long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    max_size: u64,
 }
 
 #[derive(Args)]
@@ -758,7 +884,7 @@ struct ClipboardScanArgs {
     image: PathBuf,
     #[command(flatten)]
     symbols: SymbolOptions,
-    /// 最多保留的活动剪切板格式数量。
+    /// 活动格式与历史项各自的结果上限（历史另有 256 项安全上限）。
     #[arg(long, default_value_t = 1024)]
     limit: usize,
     /// 单个活动剪切板数据块允许读取的最大大小，单位为 MiB。
@@ -780,6 +906,43 @@ struct ResidualScanArgs {
     /// 精确搜索任意文本；同时匹配 UTF-8 和 UTF-16LE，可多次指定。
     #[arg(long = "text")]
     search_texts: Vec<String>,
+}
+
+#[derive(Args)]
+struct QqScanArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    /// 仅核对指定 PID；默认识别活动 QQ.exe 进程。
+    #[arg(long)]
+    pid: Option<u64>,
+    #[arg(long, default_value_t = 2048)]
+    limit: usize,
+    /// 每类 QQNT 结构签名最多保留的物理锚点数。
+    #[arg(long, default_value_t = 4096)]
+    anchor_limit: usize,
+    /// 最多检查的 QQ 进程地址空间数。
+    #[arg(long, default_value_t = 16)]
+    process_space_limit: usize,
+}
+
+#[derive(Args)]
+struct WechatChatArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    #[arg(long)]
+    pid: Option<u64>,
+    #[arg(long, default_value_t = 2048)]
+    limit: usize,
+    #[arg(long, default_value_t = 4096)]
+    anchor_limit: usize,
+    #[arg(long, default_value_t = 16)]
+    process_space_limit: usize,
+    #[arg(long, default_value_t = 64)]
+    cache_limit: usize,
+    #[arg(long, default_value_t = 4096)]
+    cache_page_limit: usize,
 }
 
 #[derive(Args)]
@@ -824,13 +987,13 @@ struct BrowserSessionArgs {
     /// 最多保留的去重下载痕迹数量。
     #[arg(long, default_value_t = 2000)]
     download_limit: usize,
-    /// 最多尝试恢复和解析的 Cookie 数据库及旧式 Cookie 文件数量。
+    /// 各阶段最多尝试恢复和解析的浏览器数据库或账号 JSON 文件数量。
     #[arg(long, default_value_t = 256)]
     database_limit: usize,
     /// filescan 最多保留的 FILE_OBJECT 数量。
     #[arg(long, default_value_t = 1_000_000)]
     file_scan_limit: usize,
-    /// 单个 Cookie 数据库允许恢复的最大大小，单位为 MiB。
+    /// 单个浏览器数据库或账号 JSON 文件允许恢复的最大大小，单位为 MiB。
     #[arg(long, default_value_t = 256)]
     max_database_mib: usize,
     /// 最多反向映射的浏览器相关进程地址空间数量。
@@ -855,10 +1018,10 @@ struct BrowserHistoryArgs {
     /// filescan 最多保留的 FILE_OBJECT 数量。
     #[arg(long, default_value_t = 1_000_000)]
     file_scan_limit: usize,
-    /// 单个 History 数据库允许恢复的最大大小，单位为 MiB。
+    /// 单个 History / places.sqlite 数据库允许恢复的最大大小，单位为 MiB。
     #[arg(long, default_value_t = 256)]
     max_database_mib: usize,
-    /// 输出 URL 聚合摘要，或 visits 表中的逐次访问事件。
+    /// 输出 URL 聚合摘要，或 visits / moz_historyvisits 表中的逐次访问事件。
     #[arg(long, value_enum, default_value_t = BrowserHistoryView::Summary)]
     view: BrowserHistoryView,
     /// 扫描文件句柄，报告采集时持有 History 数据库的进程（不等同于访问行为人）。
@@ -1045,6 +1208,96 @@ struct PslistArgs {
 }
 
 #[derive(Args)]
+struct SymbollessContextArgs {
+    image: PathBuf,
+    #[arg(long)]
+    pid: Option<u64>,
+    #[arg(long, default_value_t = 4096)]
+    process_limit: usize,
+    #[arg(long, default_value_t = 32)]
+    limit: usize,
+    #[arg(long, default_value_t = 65_536)]
+    environment_bytes: usize,
+}
+
+#[derive(Args)]
+struct SymbollessModulesArgs {
+    image: PathBuf,
+    #[arg(long)]
+    pid: Option<u64>,
+    #[arg(long, default_value_t = 4096)]
+    process_limit: usize,
+    #[arg(long, default_value_t = 32)]
+    limit: usize,
+    #[arg(long, default_value_t = 1024)]
+    module_limit: usize,
+}
+
+#[derive(Args)]
+struct SymbollessProcessArgs {
+    image: PathBuf,
+    #[arg(long, default_value_t = 4096)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct SymbollessFileArgs {
+    image: PathBuf,
+    #[arg(long, default_value_t = 4096)]
+    process_limit: usize,
+    #[arg(long, default_value_t = 100_000)]
+    limit: usize,
+    #[arg(long)]
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct SymbollessDumpArgs {
+    image: PathBuf,
+    #[arg(long, default_value_t = 4096)]
+    process_limit: usize,
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    expected_physical: Option<String>,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value = "cache", value_parser = ["cache", "data", "image"])]
+    source: String,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    max_size: u64,
+}
+
+#[derive(Args)]
+struct SymbollessRegistryArgs {
+    image: PathBuf,
+    #[arg(long, default_value_t = 4096)]
+    process_limit: usize,
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    expected_physical: Option<String>,
+    #[arg(long, default_value = "cache", value_parser = ["cache", "data"])]
+    source: String,
+    #[arg(long, default_value = "overview", value_parser = ["overview", "printkey", "hashdump", "lsadump", "cachedump", "userassist", "amcache"])]
+    action: String,
+    #[arg(long)]
+    system_address: Option<String>,
+    #[arg(long)]
+    system_physical: Option<String>,
+    #[arg(long, default_value = "cache", value_parser = ["cache", "data"])]
+    system_source: String,
+    #[arg(long, default_value = "")]
+    key: String,
+    #[arg(long)]
+    recurse: bool,
+    #[arg(long, default_value_t = 4096)]
+    limit: usize,
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    max_size: u64,
+}
+
+#[derive(Args)]
 struct CheckPslistArgs {
     image: PathBuf,
     #[command(flatten)]
@@ -1175,6 +1428,60 @@ struct LinuxProcDumpArgs {
     /// 全部 VMA 允许导出的最大逻辑大小。
     #[arg(long, default_value_t = 16 * 1024 * 1024 * 1024u64)]
     max_total_size: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LinuxStringRegionArg {
+    /// brk 堆（[heap]）。
+    Heap,
+    /// 主线程栈（[stack]）。
+    Stack,
+    /// 无文件映射的可写区域（mmap 分配、线程栈等）。
+    Anon,
+    /// 以上全部。
+    All,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LinuxStringEncodingArg {
+    Both,
+    Utf8,
+    Utf16le,
+}
+
+#[derive(Args)]
+struct LinuxProcStringsArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolStoreOptions,
+    /// 仅分析指定 PID；默认分析所有活动线程组主进程。
+    #[arg(long)]
+    pid: Option<i32>,
+    #[arg(long, default_value_t = 65536)]
+    process_limit: usize,
+    #[arg(long, default_value_t = 1_000_000)]
+    map_limit: usize,
+    /// 扫描的区域，可重复或逗号分隔；默认 heap,stack。
+    #[arg(long, value_enum, value_delimiter = ',')]
+    region: Vec<LinuxStringRegionArg>,
+    /// 最少字符数。
+    #[arg(long, default_value_t = 4)]
+    min_length: usize,
+    /// 提取的字符串编码。
+    #[arg(long, value_enum, default_value_t = LinuxStringEncodingArg::Both)]
+    encoding: LinuxStringEncodingArg,
+    /// 仅保留包含该文本的字符串（大小写不敏感）。
+    #[arg(long)]
+    grep: Option<String>,
+    /// 单条字符串保留的最大字符数。
+    #[arg(long, default_value_t = 4096)]
+    max_string_chars: usize,
+    /// 字符串结果上限。
+    #[arg(long, default_value_t = 100_000)]
+    limit: usize,
+    /// 单个区域允许扫描的最大字节数。
+    #[arg(long, default_value_t = 256 * 1024 * 1024u64)]
+    max_region_size: u64,
 }
 
 #[derive(Args)]
@@ -1363,7 +1670,7 @@ struct LinuxKernelPluginOutput<'a, T> {
 
 #[derive(Args)]
 struct SymbolOptions {
-    /// 使用已有 JSON 配置覆盖自动符号解析。
+    /// 使用已有 JSON 或实验性 .ssym 配置覆盖自动符号解析。
     #[arg(long, conflicts_with = "pdb")]
     profile: Option<PathBuf>,
     /// 使用本地内核 PDB 覆盖自动符号解析。
@@ -1387,6 +1694,9 @@ impl SymbolOptions {
 
 #[derive(Args, Debug, Clone, Default)]
 struct SymbolStoreOptions {
+    /// 当前镜像的 System.map；校验地址后从本地精确 ISF 自动补齐类型，无类型来源时仅提供基础任务。
+    #[arg(long = "system-map", value_name = "文件")]
+    system_map: Option<PathBuf>,
     /// 可写符号缓存目录；同时兼容 --symbol-cache。
     #[arg(long, alias = "symbol-cache", value_name = "目录")]
     cache: Option<PathBuf>,
@@ -1397,10 +1707,14 @@ struct SymbolStoreOptions {
 
 impl SymbolStoreOptions {
     fn build(&self) -> SymbolStore {
-        symbol_store(
+        let store = symbol_store(
             self.cache.clone().unwrap_or_else(default_symbol_cache),
             self.search_roots.clone(),
-        )
+        );
+        match &self.system_map {
+            Some(path) => store.with_linux_system_map(path.clone()),
+            None => store,
+        }
     }
 }
 
@@ -2045,9 +2359,27 @@ struct PipeScanArgs {
     /// 跨全部进程最多检查的句柄表项数量。
     #[arg(long, default_value_t = 4_000_000)]
     handle_scan_limit: usize,
-    /// 最多输出的命名管道对象数量。
+    /// 最多输出的文件端点对象数量。
     #[arg(long, default_value_t = 100_000)]
     limit: usize,
+}
+
+#[derive(Args)]
+struct MailslotArgs {
+    #[command(flatten)]
+    scan: PipeScanArgs,
+    /// 跨全部独立队列最多检查的消息条数。
+    #[arg(long, default_value_t = 4096)]
+    message_limit: usize,
+    /// 单条消息的最大恢复字节数（硬上限 16 MiB）。
+    #[arg(long, default_value_t = 1024 * 1024)]
+    max_message_bytes: usize,
+    /// 全部消息的总字节预算（硬上限 64 MiB）。
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_total_message_bytes: usize,
+    /// 可选：将完整恢复的消息原始字节另存到目录。
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -2305,6 +2637,122 @@ struct WindowsRecentFilesArgs {
 }
 
 #[derive(Args)]
+struct ApplicationArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    /// 报告记录总上限（1–16384）。
+    #[arg(long, default_value_t = 4096)]
+    limit: usize,
+    /// 应用路径筛选后的 FILE_OBJECT 上限（1–16384）。
+    #[arg(long, default_value_t = 2048)]
+    file_limit: usize,
+    /// 最多核对内容的 FILE_OBJECT 数（1–128）。
+    #[arg(long, default_value_t = 32)]
+    max_files: usize,
+    /// 每个驻留文件的最大读取大小，MiB（1–16）。
+    #[arg(long, default_value_t = 4)]
+    max_file_mib: u64,
+    /// 明确指定待检查的活动进程；留空按应用识别。
+    #[arg(long)]
+    pid: Option<u64>,
+    /// 跳过进程内存，仅分析文件与元数据。
+    #[arg(long)]
+    skip_memory: bool,
+    #[arg(long, default_value_t = 4096)]
+    anchor_limit: usize,
+    #[arg(long, default_value_t = 64)]
+    process_limit: usize,
+}
+
+fn run_application_command(
+    args: ApplicationArgs,
+    kind: starmem::applications::ApplicationKind,
+    json: bool,
+) -> Result<()> {
+    ensure_csv_does_not_overwrite_input(&args.image)?;
+    let session = AnalysisSession::open(args.image, args.symbols.session_options())?;
+    let report = starmem::applications::analyze_application(
+        &session,
+        kind,
+        &starmem::applications::ApplicationOptions {
+            limit: args.limit,
+            file_limit: args.file_limit,
+            max_files: args.max_files,
+            max_file_bytes: args
+                .max_file_mib
+                .checked_mul(1024 * 1024)
+                .context("文件预算溢出")?,
+            pid: args.pid,
+            skip_memory: args.skip_memory,
+            anchor_limit: args.anchor_limit,
+            process_limit: args.process_limit,
+        },
+        &starmem::cancellation::CancellationToken::new(),
+    )?;
+    if json {
+        print_json(&report)?;
+    } else {
+        for r in &report.records {
+            println!(
+                "{}\t{}\t{}",
+                r.artifact_kind,
+                r.path.as_deref().unwrap_or(""),
+                r.summary
+            );
+        }
+        println!("记录={}；完整={}", report.records.len(), report.complete);
+        for w in &report.warnings {
+            warningln!("警告：{w}");
+        }
+        for l in &report.limitations {
+            eprintln!("范围：{l}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Args)]
+struct WindowsInteractionArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    /// 仅执行指定类别，可重复或逗号分隔；默认全部。
+    #[arg(long = "source", value_enum, value_delimiter = ',')]
+    sources: Vec<starmem::windows_interaction::InteractionSource>,
+    /// 每类最多输出的证据记录数。
+    #[arg(long, default_value_t = 4096)]
+    limit: usize,
+    /// 路径筛选后最多恢复的文件候选数。
+    #[arg(long, default_value_t = 256)]
+    file_limit: usize,
+    /// 每个驻留文件的最大恢复大小，单位 MiB。
+    #[arg(long, default_value_t = 32)]
+    max_file_mib: u64,
+}
+
+#[derive(Args)]
+struct BrowserPagesArgs {
+    image: PathBuf,
+    #[command(flatten)]
+    symbols: SymbolOptions,
+    /// 指定浏览器或渲染进程 PID，分析同一浏览器进程树。
+    #[arg(long)]
+    pid: Option<u64>,
+    #[arg(long, default_value_t = 4096)]
+    limit: usize,
+    #[arg(long, default_value_t = 16)]
+    process_limit: usize,
+    /// 每个进程的实际驻留读取预算（MiB），不遍历空洞大小。
+    #[arg(long, default_value_t = 64)]
+    max_process_mib: u64,
+    #[arg(long, default_value_t = 64)]
+    file_limit: usize,
+    #[arg(long, default_value_t = 4)]
+    max_file_mib: u64,
+}
+
+#[derive(Args)]
 struct UsbHistoryArgs {
     image: PathBuf,
     #[command(flatten)]
@@ -2491,13 +2939,46 @@ fn localize_argument(mut argument: clap::Arg, command_name: &str) -> clap::Arg {
 }
 
 fn argument_help(command_name: &str, id: &str) -> Option<&'static str> {
+    if command_name == "wechat-chat" {
+        match id {
+            "anchor_limit" => return Some("最多保留的 SQLite 文件头物理锚点数"),
+            "process_space_limit" => return Some("最多核对的微信进程地址空间数"),
+            "cache_limit" => return Some("最多解析的独立数据库缓存数"),
+            "cache_page_limit" => return Some("每个缓存最多核对的页节点数"),
+            "pid" => return Some("仅核对指定 PID；默认识别活动 Weixin.exe / WeChat.exe"),
+            _ => {}
+        }
+    }
+    if command_name == "qqscan" {
+        match id {
+            "anchor_limit" => return Some("每类 QQNT 结构签名最多保留的物理锚点数"),
+            "process_space_limit" => return Some("最多检查的 QQ 进程地址空间数"),
+            "pid" => return Some("仅核对指定 PID；默认识别活动 QQ.exe 进程"),
+            _ => {}
+        }
+    }
     if command_name == "browser-history" {
         match id {
-            "database_limit" => return Some("最多恢复和解析的 Chromium History 数据库数量"),
+            "database_limit" => {
+                return Some(
+                    "最多恢复和解析的 Chromium History / Firefox places.sqlite 数据库数量",
+                );
+            }
             "max_database_mib" => {
-                return Some("单个 History 数据库允许恢复的最大大小，单位为 MiB");
+                return Some("单个 History / places.sqlite 数据库允许恢复的最大大小，单位为 MiB");
             }
             "limit" => return Some("最多保留的 URL 摘要与逐次访问记录数量"),
+            _ => {}
+        }
+    }
+    if matches!(command_name, "browser-session" | "dnsscan") {
+        match id {
+            "database_limit" => {
+                return Some("各阶段最多恢复和解析的浏览器数据库或账号 JSON 文件数量");
+            }
+            "max_database_mib" => {
+                return Some("单个浏览器数据库或账号 JSON 文件的最大恢复大小，单位为 MiB");
+            }
             _ => {}
         }
     }
@@ -2558,6 +3039,7 @@ fn argument_help(command_name: &str, id: &str) -> Option<&'static str> {
         "json" => "输出便于程序处理的 JSON",
         "threads" => "并行工作线程数；0 表示使用全部逻辑处理器",
         "no_progress" => "禁用交互终端中的动态分析进度条",
+        "show_warnings" => "显示终端警告；默认隐藏，JSON/CSV 报告始终保留警告记录",
         "command" | "subcommand" => "要查看帮助的子命令",
         "text" => "要搜索的 UTF-8 文本",
         "search_texts" => "要精确搜索的任意文本；可多次指定",
@@ -2571,7 +3053,10 @@ fn argument_help(command_name: &str, id: &str) -> Option<&'static str> {
         "name" => "名称",
         "query" => "要搜索的符号文本",
         "pdb" => "本地 PDB 符号文件",
-        "profile" => "已有的 JSON 符号配置文件",
+        "system_map" => {
+            "当前 Linux 镜像的 System.map；验证地址后从本地精确 ISF 自动补齐类型，无类型来源时仅提供基础进程"
+        }
+        "profile" => "已有的 JSON 或实验性 .ssym 符号配置文件",
         "base" => "虚拟基址",
         "fetch" => "将发现的 PDB 下载到符号缓存",
         "csv" => "将当前插件的完整结构化报告写为兼容 Excel 的 UTF-8 CSV；使用 - 输出到标准输出",
@@ -2626,7 +3111,7 @@ fn argument_value_name(id: &str) -> Option<&'static str> {
     Some(match id {
         "image" => "镜像文件",
         "input" => "输入路径",
-        "output" | "csv" | "pdb" | "profile" | "strings_file" | "rules" => "文件",
+        "output" | "csv" | "pdb" | "profile" | "system_map" | "strings_file" | "rules" => "文件",
         "cache" | "search_roots" | "verify_db_roots" => "目录",
         "address" | "base" | "dtb" => "地址",
         "attribute_id" => "属性ID",
@@ -2846,6 +3331,9 @@ fn run() -> Result<()> {
         Ok(cli) => cli,
         Err(error) => exit_clap_error(error, false),
     };
+    SHOW_WARNINGS
+        .set(cli.show_warnings)
+        .map_err(|_| anyhow::anyhow!("终端警告选项已被重复初始化"))?;
     if !cli.no_progress
         && !cli.json
         && cli.csv.is_none()
@@ -2881,6 +3369,125 @@ fn run() -> Result<()> {
     let force = cli.force;
 
     match cli.command {
+        Command::SymbollessRegistry(args) => {
+            let options = starmem::windows::symbolless::RegistryOptions {
+                address: parse_integer(&args.address)?,
+                expected_physical: args
+                    .expected_physical
+                    .as_deref()
+                    .map(parse_integer)
+                    .transpose()?,
+                source: args.source,
+                action: args.action,
+                system_address: args
+                    .system_address
+                    .as_deref()
+                    .map(parse_integer)
+                    .transpose()?,
+                system_physical: args
+                    .system_physical
+                    .as_deref()
+                    .map(parse_integer)
+                    .transpose()?,
+                system_source: args.system_source,
+                key: args.key,
+                recurse: args.recurse,
+                limit: args.limit,
+                max_bytes: args.max_size,
+            };
+            options.validate()?;
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.process_limit,
+                &cancel,
+            )?;
+            print_json(&session.registry(&options, &cancel)?)?;
+        }
+        Command::SymbollessProcessModules(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let options = starmem::windows::symbolless::ProcessModulesOptions {
+                pid: args.pid,
+                limit: args.limit,
+                module_limit: args.module_limit,
+            };
+            options.validate()?;
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.process_limit,
+                &cancel,
+            )?;
+            print_json(&session.process_modules(&options, &cancel)?)?;
+        }
+        Command::SymbollessProcessContext(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.process_limit,
+                &cancel,
+            )?;
+            print_json(&session.process_context(
+                &starmem::windows::symbolless::ProcessContextOptions {
+                    pid: args.pid,
+                    limit: args.limit,
+                    environment_bytes: args.environment_bytes,
+                },
+                &cancel,
+            )?)?;
+        }
+        Command::SymbollessSystemInfo { image } => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_system_cancellable(
+                &image,
+                current_image_open_options(),
+                &cancel,
+            )?;
+            print_json(&session.system_info(&cancel)?)?;
+        }
+        Command::SymbollessProcesses(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.limit,
+                &cancel,
+            )?;
+            print_json(&session.processes(&cancel)?)?;
+        }
+        Command::SymbollessFiles(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.process_limit,
+                &cancel,
+            )?;
+            print_json(&session.files(args.limit, args.name.as_deref(), &cancel)?)?;
+        }
+        Command::SymbollessDump(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::windows::symbolless::SymbollessSession::open_cancellable(
+                &args.image,
+                current_image_open_options(),
+                args.process_limit,
+                &cancel,
+            )?;
+            let options = starmem::windows::symbolless::RecoveryOptions {
+                address: parse_integer(&args.address)?,
+                expected_physical: args
+                    .expected_physical
+                    .as_deref()
+                    .map(parse_integer)
+                    .transpose()?,
+                source: args.source,
+                max_bytes: args.max_size,
+                output: args.output,
+            };
+            print_json(&session.recover_file(&options, &cancel, || Ok(()))?)?;
+        }
         Command::BuildInfo => {
             let report = current_build_info();
             if cli.json {
@@ -3090,7 +3697,7 @@ fn run() -> Result<()> {
                 println!("WiFi/网络历史：{}", report.wireless_history.len());
                 println!("结果完整：{}", if report.complete { "是" } else { "否" });
                 for warning in &report.warnings {
-                    eprintln!("警告：{warning}");
+                    warningln!("警告：{warning}");
                 }
             }
         }
@@ -3418,7 +4025,7 @@ fn run() -> Result<()> {
                     println!("JSON 文件：{}", path.display());
                 }
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -3572,7 +4179,7 @@ fn run() -> Result<()> {
                 }
                 println!("报告完整：{}", yes_no(report.complete));
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -3664,7 +4271,7 @@ fn run() -> Result<()> {
                     report.kernel_writable_executable_bytes
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -3794,9 +4401,21 @@ fn run() -> Result<()> {
                     yes_no(report.truncated)
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
+        }
+        Command::WindowsPhys2file(args) => {
+            let session = AnalysisSession::open(args.image, args.symbols.session_options())?;
+            print_session_warnings(&session);
+            let report = starmem::windows::files::locate_physical_file(
+                session.image(),
+                session.kernel(),
+                session.profile(),
+                parse_integer(&args.physical)?,
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            print_json(&report)?;
         }
         Command::WindowsProcessString(args) => {
             let chunk_size = args
@@ -3866,7 +4485,7 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!(
+                    warningln!(
                         "警告[{}]：{}",
                         safe_terminal_text(&warning.code),
                         safe_terminal_text(&warning.message)
@@ -3874,10 +4493,41 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::MacosIr(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::macos::MacSession::open(
+                open_memory_image(args.image)?,
+                &args.profile,
+                &cancel,
+            )?;
+            let report =
+                session.analyze(&args.module, args.name.as_deref(), args.limit, &cancel)?;
+            print_json(&report)?;
+        }
+        Command::MacosDumpfile(args) => {
+            let cancel = starmem::cancellation::CancellationToken::new();
+            let session = starmem::macos::MacSession::open(
+                open_memory_image(args.image)?,
+                &args.profile,
+                &cancel,
+            )?;
+            let report = session.recover(args.address, &args.output, args.max_size, &cancel)?;
+            print_json(&report)?;
+        }
         Command::Scan(args) => {
+            ensure!(args.context_bytes <= 4096, "上下文单侧最多读取 4096 字节");
             let needle = match (args.text, args.hex) {
-                (Some(text), None) => text.into_bytes(),
-                (None, Some(hex_text)) => parse_hex(&hex_text)?,
+                (Some(text), None) => {
+                    if args.encoding == "utf16le" {
+                        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+                    } else {
+                        text.into_bytes()
+                    }
+                }
+                (None, Some(hex_text)) => {
+                    ensure!(args.encoding == "utf8", "--encoding 仅适用于 --text");
+                    parse_hex(&hex_text)?
+                }
                 (None, None) => bail!("必须提供 --text 或 --hex 其中之一"),
                 _ => unreachable!("clap 已保证两个参数互斥"),
             };
@@ -3887,7 +4537,13 @@ fn run() -> Result<()> {
                 .context("扫描块大小溢出")?;
             let image = open_memory_image(args.image)?;
             ensure!(!image.spans().is_empty(), "此镜像容器格式无法直接扫描");
-            let report = scan_exact(&image, &needle, args.limit, chunk_size)?;
+            let mut report = scan_exact(&image, &needle, args.limit, chunk_size)?;
+            report.add_context(
+                &image,
+                needle.len(),
+                args.context_bytes,
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
             if cli.json {
                 print_json(&report)?;
             } else {
@@ -3953,7 +4609,7 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -4085,7 +4741,7 @@ fn run() -> Result<()> {
                     report.owner_mapping_seconds,
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -4094,7 +4750,7 @@ fn run() -> Result<()> {
                 .max_data_mib
                 .checked_mul(1024 * 1024)
                 .context("剪切板数据块最大读取大小溢出")?;
-            eprintln!("[1/5] 正在加载镜像、解析 Windows 内核并准备符号表……");
+            eprintln!("[1/6] 正在加载镜像、解析 Windows 内核并准备符号表……");
             let session = AnalysisSession::open(&args.image, args.symbols.session_options())?;
             print_session_warnings(&session);
             let report = session.clipboard_scan(
@@ -4104,17 +4760,20 @@ fn run() -> Result<()> {
                 },
                 |stage| match stage {
                     ClipboardScanStage::Structures => {
-                        eprintln!("[2/5] 正在枚举窗口站并验证活动剪切板格式数组……")
+                        eprintln!("[2/6] 正在枚举窗口站并验证活动剪切板格式数组……")
                     }
                     ClipboardScanStage::PhysicalScan => {
-                        eprintln!("[3/5] 正在扫描活动剪切板引用的 Uscb 数据块……")
+                        eprintln!("[3/6] 正在扫描活动剪切板引用的 Uscb 数据块……")
                     }
                     ClipboardScanStage::DataRecovery => {
-                        eprintln!("[4/5] 正在按格式句柄恢复活动剪切板驻留数据……")
+                        eprintln!("[4/6] 正在按格式句柄恢复活动剪切板驻留数据……")
+                    }
+                    ClipboardScanStage::HistoryRecovery => {
+                        eprintln!("[5/6] 正在校验 TextInputHost 符号布局并读取驻留历史对象链……")
                     }
                 },
             )?;
-            eprintln!("[5/5] 正在生成活动剪切板结构报告……");
+            eprintln!("[6/6] 正在生成剪贴板与历史报告……");
             if cli.json {
                 print_json(&report)?;
             } else {
@@ -4155,6 +4814,30 @@ fn run() -> Result<()> {
                     );
                 }
 
+                println!("\n【TextInputHost 剪贴板历史】\n{}", report.history_scope);
+                for record in &report.history {
+                    println!(
+                        "[PID {}][{}][{}] {}",
+                        record.pid,
+                        record.timestamp_utc.as_deref().unwrap_or("时间未恢复"),
+                        record.text_status,
+                        safe_terminal_text(record.text.as_deref().unwrap_or("文本未恢复"))
+                    );
+                    println!(
+                        "  Control={:#x}；Item={:#x}；{}",
+                        record.chain.control_address, record.item_address, record.evidence_note
+                    );
+                }
+                for check in &report.history_checks {
+                    println!(
+                        "  来源检查 PID {:?}：{}；验证列表={}；记录={}；{}",
+                        check.pid,
+                        check.status,
+                        check.verified_controls,
+                        check.recovered_items,
+                        check.warnings.join("；")
+                    );
+                }
                 println!(
                     "\n窗口站={}；格式数组={}；活动格式={}；活动数据块={}；Uscb 标签命中={}",
                     report.window_stations_examined,
@@ -4171,7 +4854,7 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -4266,7 +4949,83 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
+                }
+            }
+        }
+        Command::Qqscan(args) => {
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let mut options = args.symbols.session_options();
+            options.allow_compatible_local_symbols = false;
+            let session = AnalysisSession::open(args.image, options)?;
+            print_session_warnings(&session);
+            eprintln!("正在扫描 QQNT 结构签名、核对 QQ 页表/VAD 并解析驻留数据……");
+            let report = starmem::qq::scan_qq(
+                &session,
+                &starmem::qq::QqScanOptions {
+                    pid: args.pid,
+                    limit: args.limit,
+                    anchor_limit: args.anchor_limit,
+                    process_space_limit: args.process_space_limit,
+                },
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for record in &report.records {
+                    println!(
+                        "[{}] {}",
+                        record.artifact_kind,
+                        serde_json::to_string(&record.data)?
+                    );
+                }
+                println!(
+                    "QQ 结构记录={}，完整性={}",
+                    report.records.len(),
+                    report.complete
+                );
+                for warning in &report.warnings {
+                    warningln!("警告：{warning}");
+                }
+            }
+        }
+        Command::WechatChat(args) => {
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let mut options = args.symbols.session_options();
+            options.allow_compatible_local_symbols = false;
+            let session = AnalysisSession::open(args.image, options)?;
+            print_session_warnings(&session);
+            let report = starmem::wechat_chat::scan_wechat_chat(
+                &session,
+                &starmem::wechat_chat::WechatChatOptions {
+                    pid: args.pid,
+                    limit: args.limit,
+                    anchor_limit: args.anchor_limit,
+                    process_space_limit: args.process_space_limit,
+                    cache_limit: args.cache_limit,
+                    cache_page_limit: args.cache_page_limit,
+                },
+                &starmem::cancellation::CancellationToken::new(),
+                &mut |stage| eprintln!("{stage}"),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for record in &report.records {
+                    println!(
+                        "[{}] {}",
+                        record.artifact_kind,
+                        serde_json::to_string(&record.data)?
+                    );
+                }
+                println!(
+                    "微信结构记录={}，完整性={}",
+                    report.records.len(),
+                    report.complete
+                );
+                for warning in &report.warnings {
+                    warningln!("警告：{warning}");
                 }
             }
         }
@@ -4397,7 +5156,40 @@ fn run() -> Result<()> {
                     report.physical_scan_seconds, report.address_mapping_seconds,
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
+                }
+            }
+        }
+        Command::BrowserPages(args) => {
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let session = AnalysisSession::open(args.image, args.symbols.session_options())?;
+            let report = starmem::browser_pages::analyze(
+                &session,
+                &starmem::browser_pages::BrowserPagesOptions {
+                    pid: args.pid,
+                    limit: args.limit,
+                    process_limit: args.process_limit,
+                    max_process_bytes: args
+                        .max_process_mib
+                        .checked_mul(1024 * 1024)
+                        .context("进程读取预算溢出")?,
+                    file_limit: args.file_limit,
+                    max_file_bytes: args
+                        .max_file_mib
+                        .checked_mul(1024 * 1024)
+                        .context("文件读取预算溢出")?,
+                },
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for page in &report.pages {
+                    println!("{}\t{}\t{}", page["root_pid"], page["domain"], page["url"]);
+                }
+                println!("页面线索={}；完整={}", report.pages.len(), report.complete);
+                for note in report.limitations.iter().chain(&report.warnings) {
+                    eprintln!("范围：{note}");
                 }
             }
         }
@@ -4436,7 +5228,7 @@ fn run() -> Result<()> {
                         eprintln!("[5/9] 正在关联 Cookie 的浏览器进程与虚拟地址……")
                     }
                     BrowserSessionStage::BrowserDatabases => {
-                        eprintln!("[6/9] 正在重组 History 下载链并提取 Login Data 站点账号……")
+                        eprintln!("[6/9] 正在解析 Chromium / Firefox 历史、下载与账号元数据……")
                     }
                     BrowserSessionStage::DownloadTraces => {
                         eprintln!("[7/9] 正在扫描下载 URL、远端 IP 与文件名……")
@@ -4510,6 +5302,8 @@ fn run() -> Result<()> {
                 // visits 视图附带一份非重复的 URL 聚合摘要；summary
                 // 视图不再复制大量同内容 JSON。
                 "visit_summaries": visit_summaries,
+                "database_sources": report.database_sources,
+                "page_candidates": report.page_candidates,
                 "artifact_owners": report.artifact_owners,
                 "artifact_owner_scan": report.artifact_owner_scan,
                 "artifact_files_found": report.artifact_files_found,
@@ -4702,7 +5496,7 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -4948,19 +5742,31 @@ fn run() -> Result<()> {
                         println!("ISF 安装目标：{}", install.destination);
                     }
                     for warning in &report.warnings {
-                        eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                        warningln!("警告 [{}]：{}", warning.kind, warning.message);
                     }
                 }
             }
         },
         Command::Profile { pdb, output } => {
-            let profile = build_eprocess_profile(&pdb)?;
+            let binary = starmem::profile::compiled::is_compiled_path(&output);
+            let compiled = binary
+                .then(|| starmem::profile::compiled::compile_pdb(&pdb))
+                .transpose()?;
+            let profile = if let Some(bytes) = &compiled {
+                starmem::profile::compiled::CompiledProfile::parse(bytes)?.to_profile()
+            } else {
+                build_eprocess_profile(&pdb)?
+            };
             remember_windows_symbol_identity(&profile)?;
             OUTPUT_POLICY
                 .get()
                 .context("输出安全策略尚未初始化")?
                 .write_file_atomic(&output, |file| {
-                    serde_json::to_writer_pretty(BufWriter::new(file), &profile)?;
+                    if let Some(bytes) = &compiled {
+                        std::io::Write::write_all(file, bytes)?;
+                    } else {
+                        serde_json::to_writer_pretty(BufWriter::new(file), &profile)?;
+                    }
                     Ok(())
                 })?;
             if cli.json {
@@ -4977,7 +5783,7 @@ fn run() -> Result<()> {
         }
         Command::Pslist(args) => {
             let image = open_memory_image(&args.image)?;
-            if probe_linux_memory(&image)? {
+            if args.symbols.store.system_map.is_some() || probe_linux_memory(&image)? {
                 ensure!(
                     args.symbols.profile.is_none() && args.symbols.pdb.is_none(),
                     "Linux pslist 从内存 BTF、Volatility 3 ISF 或严格构建指纹自动选择布局，不接受 Windows --profile/--pdb"
@@ -5026,7 +5832,7 @@ fn run() -> Result<()> {
                         report.scan_gib_per_second
                     );
                     for warning in &report.warnings {
-                        eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                        warningln!("警告 [{}]：{}", warning.kind, warning.message);
                     }
                 }
             } else {
@@ -5075,7 +5881,7 @@ fn run() -> Result<()> {
                         localize_runtime_message(&format!("{:?}", report.stop_reason))
                     );
                     for warning in report.warnings {
-                        eprintln!(
+                        warningln!(
                             "警告 [{}]：{}",
                             warning.kind,
                             localize_runtime_message(&warning.message)
@@ -5141,7 +5947,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5178,7 +5984,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5224,7 +6030,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5262,7 +6068,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5304,7 +6110,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5364,7 +6170,7 @@ fn run() -> Result<()> {
                     report.scope,
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5407,7 +6213,98 @@ fn run() -> Result<()> {
                     report.source
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
+                }
+            }
+        }
+        Command::LinuxProcStrings(args) => {
+            use starmem::linux_process::strings::{LinuxProcStringsOptions, LinuxStringRegion};
+            ensure!(args.process_limit > 0, "活动任务链上限必须大于零");
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let image = open_memory_image(&args.image)?;
+            ensure!(
+                is_supported_linux_physical_image(&image),
+                "linux.proc.strings 仅支持 Linux LiME、RAW、VMware VMEM 或物理内存 EWF 镜像"
+            );
+            let mut regions = Vec::new();
+            for region in &args.region {
+                match region {
+                    LinuxStringRegionArg::Heap => regions.push(LinuxStringRegion::Heap),
+                    LinuxStringRegionArg::Stack => regions.push(LinuxStringRegion::Stack),
+                    LinuxStringRegionArg::Anon => regions.push(LinuxStringRegion::Anonymous),
+                    LinuxStringRegionArg::All => regions.extend([
+                        LinuxStringRegion::Heap,
+                        LinuxStringRegion::Stack,
+                        LinuxStringRegion::Anonymous,
+                    ]),
+                }
+            }
+            let mut options = LinuxProcStringsOptions {
+                pid: args.pid,
+                process_limit: args.process_limit,
+                map_limit: args.map_limit,
+                min_length: args.min_length,
+                utf8: args.encoding != LinuxStringEncodingArg::Utf16le,
+                utf16le: args.encoding != LinuxStringEncodingArg::Utf8,
+                grep: args.grep.clone(),
+                max_string_chars: args.max_string_chars,
+                limit: args.limit,
+                max_region_size: args.max_region_size,
+                ..LinuxProcStringsOptions::default()
+            };
+            if !regions.is_empty() {
+                options.regions = regions;
+            }
+            let session =
+                LinuxAnalysisSession::from_image_with_symbol_store(image, &args.symbols.build())?;
+            let report =
+                session.proc_strings(&options, &starmem::cancellation::CancellationToken::new())?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{:>7} {:<16} {:<9} {:>18} {:<7} 文本",
+                    "PID", "进程", "区域", "地址", "编码"
+                );
+                for record in &report.records {
+                    println!(
+                        "{:>7} {:<16} {:<9} {:#018x} {:<7} {}{}",
+                        record.pid,
+                        safe_terminal_text(&record.process_name),
+                        format!("{:?}", record.region).to_lowercase(),
+                        record.address,
+                        format!("{:?}", record.encoding).to_lowercase(),
+                        safe_terminal_text(&record.text),
+                        if record.truncated { "…" } else { "" }
+                    );
+                }
+                let scanned = report
+                    .regions
+                    .iter()
+                    .filter(|region| !region.skipped)
+                    .count();
+                let missing: u64 = report
+                    .regions
+                    .iter()
+                    .map(|region| region.missing_bytes)
+                    .sum();
+                println!(
+                    "\n进程={}/{}；区域={}（跳过={}）；字符串={}{}；缺页字节={}；是否完整={}",
+                    report.processes_recovered,
+                    report.processes_considered,
+                    scanned,
+                    report.regions.len() - scanned,
+                    report.record_count,
+                    if report.limit_reached {
+                        "（已达上限）"
+                    } else {
+                        ""
+                    },
+                    missing,
+                    yes_no(report.complete)
+                );
+                for warning in &report.warnings {
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5460,7 +6357,7 @@ fn run() -> Result<()> {
                     report.output_directory
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -5544,7 +6441,7 @@ fn run() -> Result<()> {
                     report.scope
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+                    warningln!("警告 [{}]：{}", warning.kind, warning.message);
                 }
             }
         }
@@ -6484,6 +7381,32 @@ fn run() -> Result<()> {
         Command::Deskscan(args) => run_desktop_plugin(args, true, cli.json)?,
         Command::GuiWindows(args) => run_windows_plugin(args, cli.json)?,
         Command::Windowtitles(args) => run_window_titles_plugin(args, cli.json)?,
+        Command::MouseHistory(args) => {
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let mut options = args.symbols.session_options();
+            options.allow_compatible_local_symbols = false;
+            let session = AnalysisSession::open(args.image, options)?;
+            print_session_warnings(&session);
+            let report = starmem::mouse_history::analyze_mouse_history(
+                &session,
+                args.limit,
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for s in &report.sessions {
+                    println!(
+                        "会话 {} · {} · {} 个点 · {}",
+                        s.session_id, s.status, s.record_count, s.coordinate_unit
+                    );
+                    for warning in &s.warnings {
+                        eprintln!("  {warning}");
+                    }
+                }
+                print_plugin_footer(report.records.len(), report.complete, &report.warnings);
+            }
+        }
         Command::GdiBitmap(args) => {
             let max_bitmap_bytes = args
                 .max_bitmap_mib
@@ -7220,7 +8143,7 @@ fn run() -> Result<()> {
                     );
                 }
                 for warning in report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(&warning));
+                    warningln!("警告：{}", localize_runtime_message(&warning));
                 }
             }
         }
@@ -7907,8 +8830,53 @@ fn run() -> Result<()> {
                 );
                 println!("范围：{}", report.scope);
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
+            }
+        }
+        Command::Mailslots(args) => {
+            let session =
+                AnalysisSession::open(args.scan.image, args.scan.symbols.session_options())?;
+            print_session_warnings(&session);
+            let report = session.mailslots(
+                &MailslotOptions {
+                    file_limit: args.scan.file_limit,
+                    process_limit: args.scan.process_limit,
+                    handle_scan_limit: args.scan.handle_scan_limit,
+                    limit: args.scan.limit,
+                    message_limit: args.message_limit,
+                    max_message_bytes: args.max_message_bytes,
+                    max_total_message_bytes: args.max_total_message_bytes,
+                    output: args.output,
+                    force: cli.force,
+                },
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for record in &report.records {
+                    println!(
+                        "{:#018x} {} {} {}",
+                        record.file_object,
+                        record.endpoint_kind,
+                        record.endpoint_state,
+                        record.full_name
+                    );
+                    for owner in &record.owners {
+                        println!(
+                            "  PID={} {} 句柄={:#x}",
+                            owner.pid, owner.process, owner.handle
+                        );
+                    }
+                }
+                println!(
+                    "独立队列={}；恢复消息={}；恢复字节={}",
+                    report.queues.len(),
+                    report.recovered_messages,
+                    report.recovered_bytes
+                );
+                print_plugin_footer(report.records.len(), report.complete, &report.warnings);
             }
         }
         Command::Prefetchscan(args) => {
@@ -7961,7 +8929,7 @@ fn run() -> Result<()> {
                 );
                 println!("范围：{}", report.scope);
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -8240,7 +9208,7 @@ fn run() -> Result<()> {
                     println!("范围：{}", report.scope);
                     println!("路径语义：{}", report.path_semantics);
                     for warning in &report.warnings {
-                        eprintln!(
+                        warningln!(
                             "警告 [{}]{}：{}",
                             warning.kind,
                             warning
@@ -8279,7 +9247,7 @@ fn run() -> Result<()> {
                         report.scan_gib_per_second,
                     );
                     for warning in report.warnings {
-                        eprintln!("警告：{}", localize_runtime_message(&warning));
+                        warningln!("警告：{}", localize_runtime_message(&warning));
                     }
                 }
             }
@@ -8411,7 +9379,7 @@ fn run() -> Result<()> {
                     }
                     for fragment in &candidate.fragments {
                         for invalid in &fragment.parse_report.invalid_lines {
-                            eprintln!(
+                            warningln!(
                                 "警告 [passwd_invalid_line] 候选 {} 文件偏移 {:#x} 片段行 {}：{}；原始={} ",
                                 candidate_index + 1,
                                 fragment.file_offset,
@@ -8421,7 +9389,7 @@ fn run() -> Result<()> {
                             );
                         }
                         for warning in &fragment.parse_report.warnings {
-                            eprintln!(
+                            warningln!(
                                 "警告 [{}] 候选 {} 文件偏移 {:#x} 片段行 {}：{}",
                                 warning.kind,
                                 candidate_index + 1,
@@ -8433,7 +9401,7 @@ fn run() -> Result<()> {
                     }
                 }
                 for warning in &report.filescan.warnings {
-                    eprintln!(
+                    warningln!(
                         "警告 [filescan:{}]{}：{}",
                         warning.kind,
                         warning
@@ -8445,7 +9413,7 @@ fn run() -> Result<()> {
                     );
                 }
                 for warning in &report.warnings {
-                    eprintln!(
+                    warningln!(
                         "警告 [{}]{}：{}",
                         warning.kind,
                         warning
@@ -8848,11 +9816,11 @@ fn run() -> Result<()> {
                     };
                     println!("SHA-256：{}（{}）", report.sha256, sha256_scope);
                     if report.missing_bytes > 0 {
-                        eprintln!(
+                        warningln!(
                             "警告：输出中的缺失区间是零占位，不属于恢复证据；实际证据范围仅为 extents 中列出的已验证页"
                         );
                     } else if !report.tree_complete {
-                        eprintln!(
+                        warningln!(
                             "警告：所有逻辑字节均已恢复，但页树结构告警使本次恢复不能标记为完整"
                         );
                     }
@@ -8863,14 +9831,14 @@ fn run() -> Result<()> {
                         );
                     }
                     if report.missing_ranges.len() > 32 {
-                        eprintln!(
+                        warningln!(
                             "警告：另有 {} 个缺失区间未在终端展开；请使用 --json 或 --csv 查看完整报告",
                             report.missing_ranges.len() - 32
                         );
                     }
                     println!("页缓存告警事件：{}", report.warning_count);
                     for warning in &report.warnings {
-                        eprintln!(
+                        warningln!(
                             "警告 [{}]{}：{}",
                             warning.kind,
                             warning
@@ -8893,7 +9861,7 @@ fn run() -> Result<()> {
                             selection.warning_count
                         );
                         for warning in &selection.warnings {
-                            eprintln!(
+                            warningln!(
                                 "警告 [filescan:{}]{}：{}",
                                 warning.kind,
                                 warning
@@ -8931,7 +9899,7 @@ fn run() -> Result<()> {
                         println!("文件名：{name}");
                     }
                     for warning in report.warnings {
-                        eprintln!("警告：{}", localize_runtime_message(&warning));
+                        warningln!("警告：{}", localize_runtime_message(&warning));
                     }
                 }
             }
@@ -8985,7 +9953,7 @@ fn run() -> Result<()> {
                 );
                 println!("查询视图：{}", report.database.view_semantic);
                 if let Some(error) = &report.database.query_error {
-                    eprintln!("SQLite 查询警告：{error}");
+                    warningln!("SQLite 查询警告：{error}");
                 }
                 for table in &report.database.tables {
                     println!(
@@ -9005,7 +9973,7 @@ fn run() -> Result<()> {
                         yes_no(table.query_complete),
                     );
                     if let Some(error) = &table.error {
-                        eprintln!("  表 {} 查询警告：{error}", table.name);
+                        warningln!("  表 {} 查询警告：{error}", table.name);
                     }
                 }
                 for sidecar in &report.sidecars {
@@ -9019,11 +9987,11 @@ fn run() -> Result<()> {
                     );
                     println!("  语义：{}", sidecar.details.note);
                     for warning in &sidecar.warnings {
-                        eprintln!("  Sidecar {} 警告：{warning}", sidecar.kind);
+                        warningln!("  Sidecar {} 警告：{warning}", sidecar.kind);
                     }
                 }
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -9057,11 +10025,11 @@ fn run() -> Result<()> {
                             timeline_csv.display()
                         );
                         for warning in &report.warnings {
-                            eprintln!("警告：事件时间线：{warning}");
+                            warningln!("警告：事件时间线：{warning}");
                         }
                     }
                     Err(error) => {
-                        eprintln!("警告：自动生成事件时间线失败：{error:#}");
+                        warningln!("警告：自动生成事件时间线失败：{error:#}");
                     }
                 }
             }
@@ -9093,10 +10061,10 @@ fn run() -> Result<()> {
                     println!("JSON 文件：{}", path.display());
                 }
                 if report.truncated {
-                    eprintln!("警告：已达到事件数量上限");
+                    warningln!("警告：已达到事件数量上限");
                 }
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -9256,9 +10224,77 @@ fn run() -> Result<()> {
                 );
                 println!("范围：{}", report.scope);
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
+        }
+        Command::WindowsInteraction(args) => {
+            ensure_csv_does_not_overwrite_input(&args.image)?;
+            let mut options = args.symbols.session_options();
+            options.allow_compatible_local_symbols = false;
+            let session = AnalysisSession::open(args.image, options)?;
+            print_session_warnings(&session);
+            let report = starmem::windows_interaction::analyze_windows_interaction(
+                &session,
+                &starmem::windows_interaction::InteractionOptions {
+                    sources: args.sources,
+                    limit: args.limit,
+                    file_limit: args.file_limit,
+                    max_file_bytes: args
+                        .max_file_mib
+                        .checked_mul(1024 * 1024)
+                        .context("文件预算溢出")?,
+                },
+                &starmem::cancellation::CancellationToken::new(),
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                for (name, section) in &report.sources {
+                    println!(
+                        "{name}: {}，{} 条记录，complete={}",
+                        section.status,
+                        section.records.len(),
+                        section.complete
+                    );
+                    for check in &section.checks {
+                        if check.status != "checked" {
+                            eprintln!("  {} / {}：{}", check.scope, check.status, check.reason);
+                        }
+                    }
+                }
+            }
+        }
+        Command::Bitlocker(args) => run_application_command(
+            args,
+            starmem::applications::ApplicationKind::Bitlocker,
+            cli.json,
+        )?,
+        Command::Veracrypt(args) => run_application_command(
+            args,
+            starmem::applications::ApplicationKind::Veracrypt,
+            cli.json,
+        )?,
+        Command::Sunlogin(args) => run_application_command(
+            args,
+            starmem::applications::ApplicationKind::Sunlogin,
+            cli.json,
+        )?,
+        Command::Anydesk(args) => run_application_command(
+            args,
+            starmem::applications::ApplicationKind::Anydesk,
+            cli.json,
+        )?,
+        Command::Wps(args) => {
+            run_application_command(args, starmem::applications::ApplicationKind::Wps, cli.json)?
+        }
+        Command::Huorong(args) => run_application_command(
+            args,
+            starmem::applications::ApplicationKind::Huorong,
+            cli.json,
+        )?,
+        Command::AiChat(args) => {
+            run_application_command(args, starmem::applications::ApplicationKind::Ai, cli.json)?
         }
         Command::WindowsRecentFiles(args) => {
             ensure_csv_does_not_overwrite_input(&args.image)?;
@@ -9322,7 +10358,7 @@ fn run() -> Result<()> {
                     yes_no(report.complete),
                 );
                 for warning in &report.warnings {
-                    eprintln!("警告：{}", localize_runtime_message(warning));
+                    warningln!("警告：{}", localize_runtime_message(warning));
                 }
             }
         }
@@ -9443,10 +10479,10 @@ fn run_artifact_export(
         println!("失败数：{}", report.failed);
         println!("清单：{}\\export-report.json", report.output_directory);
         if report.truncated {
-            eprintln!("警告：已达到取证文件数量上限");
+            warningln!("警告：已达到取证文件数量上限");
         }
         for warning in report.warnings {
-            eprintln!("警告：{}", localize_runtime_message(&warning));
+            warningln!("警告：{}", localize_runtime_message(&warning));
         }
     }
     Ok(())
@@ -9913,7 +10949,7 @@ fn print_thread_table(records: &[starmem::windows::process_plugins::ThreadRecord
 
 fn print_session_warnings(session: &AnalysisSession) {
     for warning in session.warnings() {
-        eprintln!("警告：{}", localize_runtime_message(warning));
+        warningln!("警告：{}", localize_runtime_message(warning));
     }
 }
 
@@ -9942,7 +10978,7 @@ fn print_linux_kernel_session_evidence(evidence: &LinuxKernelSessionEvidence) {
         evidence.bytes_scanned, evidence.scan_seconds, evidence.scan_gib_per_second,
     );
     for warning in &evidence.symbol_warnings {
-        eprintln!("符号警告 [{}]：{}", warning.kind, warning.message);
+        warningln!("符号警告 [{}]：{}", warning.kind, warning.message);
     }
     println!();
 }
@@ -9959,7 +10995,7 @@ fn print_linux_evidence_footer(
         yes_no(complete),
     );
     for warning in warnings {
-        eprintln!(
+        warningln!(
             "警告 [{}/{:?}]：{}",
             warning.code,
             warning.severity,
@@ -9971,7 +11007,7 @@ fn print_linux_evidence_footer(
 fn print_plugin_footer(count: usize, complete: bool, warnings: &[String]) {
     println!("\n记录数：{count}；是否完整：{}", yes_no(complete));
     for warning in warnings {
-        eprintln!("警告：{}", localize_runtime_message(warning));
+        warningln!("警告：{}", localize_runtime_message(warning));
     }
 }
 
@@ -10105,7 +11141,7 @@ fn print_packet_scan_report(report: &starmem::packet_scan::PacketScanReport) {
         );
     }
     for warning in &report.warnings {
-        eprintln!("警告：{}", localize_runtime_message(warning));
+        warningln!("警告：{}", localize_runtime_message(warning));
     }
 }
 
@@ -10197,7 +11233,7 @@ fn print_mapping_report(report: &starmem::address::VirtualMappingReport) {
         yes_no(report.truncated)
     );
     for warning in &report.warnings {
-        eprintln!("警告：{}", localize_runtime_message(warning));
+        warningln!("警告：{}", localize_runtime_message(warning));
     }
 }
 
@@ -10285,7 +11321,7 @@ fn output_linux_process_tree(
         report.bytes_scanned, report.scan_seconds, report.scan_gib_per_second
     );
     for warning in &report.warnings {
-        eprintln!("警告 [{}]：{}", warning.kind, warning.message);
+        warningln!("警告 [{}]：{}", warning.kind, warning.message);
     }
     Ok(())
 }
@@ -10460,6 +11496,7 @@ fn output_policy_from_matches(matches: &clap::ArgMatches) -> Result<OutputPolicy
         "verify_db_roots",
         "search_roots",
         "isf",
+        "system_map",
         "metadata",
     ] {
         for path in matched_path_arguments(matches, id) {
@@ -10517,7 +11554,12 @@ fn output_policy_from_matches(matches: &clap::ArgMatches) -> Result<OutputPolicy
             policy.output(target);
         } else {
             let mut target = OutputTarget::file("output.file", output);
-            if command == "dumpfile" {
+            if command == "symbolless.dumpfile" {
+                target = target
+                    .with_sibling_suffix(".partial")
+                    .with_sibling_suffix(".recovery.json")
+                    .with_sibling_suffix(".partial.recovery.json");
+            } else if command == "dumpfile" {
                 target = target.with_sibling_suffix(".partial");
             } else if command == "linux.module-extract" {
                 target = target
@@ -10892,6 +11934,19 @@ fn linux_symbol_identity_from_report(
     root: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<SymbolIdentity> {
     let root = root?;
+    if let Some(map) = root
+        .get("kernel")
+        .and_then(|kernel| kernel.get("system_map"))
+        .or_else(|| root.get("system_map"))
+        && let Some(digest) = map.get("sha256").and_then(serde_json::Value::as_str)
+    {
+        let mut identity = SymbolIdentity::new("linux_system_map", digest);
+        identity.digest = Some(DigestReference::new("sha256", digest));
+        identity
+            .details
+            .insert("types_available".into(), serde_json::json!(false));
+        return Some(identity);
+    }
     let candidates = [
         root.get("kernel_session")
             .and_then(|value| value.get("symbol_identity")),
@@ -11360,7 +12415,7 @@ fn print_browser_session_report(report: &BrowserSessionReport) {
         report.timing.total_seconds
     );
     for warning in &report.warnings {
-        eprintln!("警告：{}", localize_runtime_message(warning));
+        warningln!("警告：{}", localize_runtime_message(warning));
     }
 }
 
@@ -12073,7 +13128,7 @@ mod tests {
 
     #[test]
     fn leaf_command_manifest_matches_the_real_clap_tree() {
-        fn value_type(argument: &clap::Arg, name: &str) -> &'static str {
+        fn value_type(_command_id: &str, argument: &clap::Arg, name: &str) -> &'static str {
             if matches!(
                 argument.get_action(),
                 clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
@@ -12092,6 +13147,10 @@ mod tests {
                     | "file-object"
                     | "offset"
                     | "record"
+                    | "physical"
+                    | "expected-physical"
+                    | "system-address"
+                    | "system-physical"
                     | "qevm-above-4g-base"
             ) {
                 return "address";
@@ -12131,29 +13190,35 @@ mod tests {
                         | "threads"
                         | "chunk-mib"
                         | "context-bytes"
+                        | "environment-bytes"
                         | "session-id"
                         | "index"
                         | "length"
                         | "age"
                         | "correlation-window-ms"
                         | "overlap-kib"
+                        | "min-length"
                 )
             {
                 return "integer";
             }
-            if matches!(
-                name,
-                "source"
-                    | "view"
-                    | "table"
-                    | "feature"
-                    | "severity"
-                    | "format"
-                    | "action"
-                    | "min-severity"
-                    | "offset-kind"
-                    | "encoding"
-            ) {
+            if (name == "module" && argument.get_value_parser().possible_values().is_some())
+                || matches!(
+                    name,
+                    "source"
+                        | "system-source"
+                        | "view"
+                        | "table"
+                        | "feature"
+                        | "severity"
+                        | "format"
+                        | "action"
+                        | "min-severity"
+                        | "offset-kind"
+                        | "encoding"
+                        | "region"
+                )
+            {
                 return "choice";
             }
             // A string path can select a file inside the captured filesystem.
@@ -12172,6 +13237,7 @@ mod tests {
                     "input"
                         | "pdb"
                         | "profile"
+                        | "system-map"
                         | "isf"
                         | "hive"
                         | "system"
@@ -12194,6 +13260,7 @@ mod tests {
                 "csv",
                 "threads",
                 "no_progress",
+                "show_warnings",
                 "force",
                 "raw_objects",
                 "metadata",
@@ -12233,7 +13300,7 @@ mod tests {
                             .replace('_', "-");
                         serde_json::json!({
                             "name": name,
-                            "value_type": value_type(argument, &name),
+                            "value_type": value_type(&command_id, argument, &name),
                             "required": argument.is_required_set(),
                             "repeatable": matches!(
                                 argument.get_action(),
@@ -12257,32 +13324,36 @@ mod tests {
         let registry = starmem::command_registry::CommandRegistry::load_embedded()
             .expect("内置叶子命令 manifest 必须有效");
         assert_eq!(commands.len(), registry.len());
+        let mut mismatches = Vec::new();
         for cli in commands {
             let command_id = cli["command_id"].as_str().unwrap();
             let contract = registry
                 .by_id(command_id)
                 .unwrap_or_else(|| panic!("manifest 缺少 CLI 叶子命令 {command_id}"));
-            assert_eq!(
-                serde_json::to_value(&contract.cli_path).unwrap(),
-                cli["cli_path"],
-                "{command_id} cli_path"
-            );
-            assert_eq!(
-                serde_json::to_value(&contract.aliases.values).unwrap(),
-                cli["aliases"],
-                "{command_id} aliases"
-            );
-            assert_eq!(
-                contract.help.value.as_deref(),
-                cli["help"].as_str(),
-                "{command_id} help"
-            );
-            assert_eq!(
-                serde_json::to_value(&contract.arguments.items).unwrap(),
-                cli["arguments"],
-                "{command_id} arguments"
-            );
+            for (field, declared) in [
+                (
+                    "cli_path",
+                    serde_json::to_value(&contract.cli_path).unwrap(),
+                ),
+                (
+                    "aliases",
+                    serde_json::to_value(&contract.aliases.values).unwrap(),
+                ),
+                ("help", serde_json::to_value(&contract.help.value).unwrap()),
+                (
+                    "arguments",
+                    serde_json::to_value(&contract.arguments.items).unwrap(),
+                ),
+            ] {
+                if declared != cli[field] {
+                    mismatches.push(format!(
+                        "{command_id} {field}: declared={declared}; actual={}",
+                        cli[field]
+                    ));
+                }
+            }
         }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
     #[test]
@@ -12365,6 +13436,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_warnings_are_opt_in_before_or_after_subcommands() {
+        let defaults = localized_cli_command()
+            .try_get_matches_from(["starmem", "system-info", "memory.raw"])
+            .unwrap();
+        assert!(!defaults.get_flag("show_warnings"));
+        for args in [
+            vec!["starmem", "--show-warnings", "system-info", "memory.raw"],
+            vec!["starmem", "system-info", "memory.raw", "--show-warnings"],
+            vec!["starmem", "symbols", "id", "memory.raw", "--show-warnings"],
+        ] {
+            let matches = localized_cli_command().try_get_matches_from(args).unwrap();
+            assert!(matches.get_flag("show_warnings"));
+        }
+    }
+
+    #[test]
     fn cli_accepts_global_no_progress_after_a_subcommand() {
         let matches = localized_cli_command()
             .try_get_matches_from(["starmem", "linux.pstree", "memory.lime", "--no-progress"])
@@ -12441,6 +13528,65 @@ mod tests {
             .try_get_matches_from(["starmem", "windows-timeline", "memory.raw"])
             .unwrap();
         assert_eq!(alias.subcommand_name(), Some("windows.timeline"));
+    }
+
+    #[test]
+    fn windows_interaction_accepts_bounded_source_selection() {
+        let matches = localized_cli_command()
+            .try_get_matches_from([
+                "starmem",
+                "windows.interaction",
+                "memory.raw",
+                "--source",
+                "focus,edit,ime",
+                "--source",
+                "browser-tabs",
+                "--file-limit",
+                "12",
+                "--max-file-mib",
+                "4",
+            ])
+            .unwrap();
+        let parsed = Cli::from_arg_matches(&matches).unwrap();
+        let Command::WindowsInteraction(args) = parsed.command else {
+            panic!("wrong command");
+        };
+        assert_eq!(args.sources.len(), 4);
+        assert_eq!(args.file_limit, 12);
+        assert_eq!(args.max_file_mib, 4);
+        let registry = starmem::command_registry::CommandRegistry::load_embedded().unwrap();
+        let contract = registry.by_id("windows.interaction").unwrap();
+        assert_eq!(
+            contract
+                .arguments
+                .items
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "image",
+                "profile",
+                "pdb",
+                "system-map",
+                "cache",
+                "symbol-path",
+                "source",
+                "limit",
+                "file-limit",
+                "max-file-mib"
+            ]
+        );
+        assert!(
+            localized_cli_command()
+                .try_get_matches_from([
+                    "starmem",
+                    "windows.interaction",
+                    "memory.raw",
+                    "--source",
+                    "unknown"
+                ])
+                .is_err()
+        );
     }
 
     #[test]
@@ -13059,6 +14205,38 @@ mod tests {
             .try_get_matches_from(["starmem", "info", "memory.raw", "--csv", "-"])
             .unwrap();
         ensure_matched_csv_does_not_overwrite_image(&matches).unwrap();
+    }
+
+    #[test]
+    fn system_map_is_a_protected_input_and_has_separate_evidence_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("memory.raw");
+        let map = root.path().join("System.map");
+        fs::write(&input, b"fixture").unwrap();
+        fs::write(&map, b"fixture").unwrap();
+        let matches = localized_cli_command()
+            .try_get_matches_from([
+                "starmem",
+                "pslist",
+                input.to_str().unwrap(),
+                "--system-map",
+                map.to_str().unwrap(),
+                "--csv",
+                map.to_str().unwrap(),
+                "--force",
+            ])
+            .unwrap();
+        assert!(
+            output_policy_from_matches(&matches)
+                .unwrap()
+                .preflight()
+                .is_err()
+        );
+        let report = serde_json::json!({"kernel": {"system_map": {"sha256": "map-digest", "symbol_count": 4}}});
+        let identity = linux_symbol_identity_from_report(report.as_object()).unwrap();
+        assert_eq!(identity.kind, "linux_system_map");
+        assert_eq!(identity.details["types_available"], false);
+        assert!(linux_symbol_identity_from_report(report["kernel"].as_object()).is_some());
     }
 
     #[test]
