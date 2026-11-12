@@ -64,6 +64,7 @@ jobs:
           python -m json.tool schemas/raw-object-v1.schema.json >/dev/null
           python -m json.tool schemas/release-manifest-v1.schema.json >/dev/null
           python scripts/validate_json_schemas.py
+          python scripts/test-convert-macos-profile.py
           python scripts/starmem_benchmark.py validate benchmarks/corpus.example.json
 
       - name: Check formatting

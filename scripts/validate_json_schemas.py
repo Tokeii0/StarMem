@@ -192,6 +192,13 @@ def validate(root: pathlib.Path) -> None:
             raise ValueError(f"leaf manifest equivalence_id differs from command_id: {command}")
     for command in commands:
         validators["evidence"].validate(evidence_document(command))
+    registry_equivalence = checked_validator({
+        "$schema": schemas["command_registry"]["$schema"],
+        "$defs": schemas["command_registry"]["$defs"],
+        "$ref": "#/$defs/equivalenceRecord",
+    })
+    for record in commands.values():
+        registry_equivalence.validate(record)
 
     print(
         json.dumps(
@@ -199,6 +206,7 @@ def validate(root: pathlib.Path) -> None:
                 "schemas_checked": len(schemas),
                 "leaf_envelopes_validated": len(commands),
                 "leaf_declarations_validated": len(declarations),
+                "registry_equivalence_records_validated": len(commands),
                 "equivalence_document": "valid",
                 "corpus_document": "valid",
                 "raw_object_document": "valid",

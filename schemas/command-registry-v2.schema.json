@@ -139,7 +139,7 @@
       "properties": {
         "platform": {
           "type": "array",
-          "items": {"enum": ["windows", "linux"]},
+          "items": {"enum": ["windows", "linux", "macos"]},
           "minItems": 1,
           "uniqueItems": true
         },
@@ -168,7 +168,7 @@
       ],
       "properties": {
         "status": {"enum": ["exact", "partial", "composite", "no_equivalent"]},
-        "platform": {"enum": ["cross", "windows", "linux"]},
+        "platform": {"enum": ["cross", "windows", "linux", "macos"]},
         "volatility3_plugins": {
           "type": "array",
           "items": {"type": "string", "minLength": 1},

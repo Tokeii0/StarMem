@@ -26,6 +26,7 @@
 
 无符号分析保持 V3 的实验性、手动执行边界。macOS 路径需要显式符号，范围为
 OS X 10.8–10.11 x86-64；命令存在不表示任意 macOS 镜像都已验证。
+`scripts/convert-macos-profile.py` 可将公开 dsymutil/vtypes ZIP 转换为显式符号 JSON。
 新增功能的具体输入、预算和来源限制以各命令的 `--help` / `--help-en` 为准。
 
 ## 同步的已有能力
