@@ -58,6 +58,7 @@ GENERATED_EVIDENCE_SUFFIXES = {
 }
 ALLOWED_PACKAGE_PATHS = {
     ".cargo_vcs_info.json",
+    "CHANGELOG.md",
     "Cargo.lock",
     "Cargo.toml",
     "Cargo.toml.orig",
@@ -81,6 +82,7 @@ ALLOWED_PACKAGE_PATHS = {
     "schemas/release-manifest-v1.schema.json",
 }
 REQUIRED_RELATIVE_PATHS = {
+    "CHANGELOG.md",
     "Cargo.lock",
     "LICENSE",
     "README.en.md",

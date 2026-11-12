@@ -8,6 +8,11 @@ $env:STARMEM_SYMBOL_PATH = $windowsSymbols
 
 ## 建立系统和进程基线
 
+Windows 7 SP1 x86 PAE 已验证 `windows-info`、`pslist` 与 `system-info --quick`。
+引擎从 PDB 的指针宽度选择分页模式，并核对实际映射内核的 CodeView GUID/age。
+这不代表所有插件都支持 32 位对象布局：`netscan`、DLL、VAD、Hive 和句柄等尚未适配的入口会明确报错；不能把报错或未恢复记录解释为没有对应证据。
+`system-info --quick` 跳过深度网络和注册表扫描，其部分结果状态需要保留。
+
 ```powershell
 & $starmem --json system-info $windowsImage
 & $starmem --json acquisition-info $windowsImage

@@ -15,6 +15,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#supported-analysis">Supported analysis</a> ·
   <a href="#documentation">Docs</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#development-and-contributing">Contribute</a>
 </p>
 

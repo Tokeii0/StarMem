@@ -112,6 +112,54 @@ pub struct X64AddressSpace<'a> {
     directory_table_base: u64,
 }
 
+/// Windows virtual reads must keep the guest's paging mode and pointer width together.
+pub enum WindowsAddressSpace<'a> {
+    X64(X64AddressSpace<'a>),
+    X86Pae(X86PaeAddressSpace<'a>),
+}
+
+impl WindowsAddressSpace<'_> {
+    pub fn pointer_size(&self) -> u64 {
+        match self {
+            Self::X64(_) => 8,
+            Self::X86Pae(_) => 4,
+        }
+    }
+
+    pub fn translate(&self, address: u64) -> Result<u64> {
+        match self {
+            Self::X64(space) => space.translate(address),
+            Self::X86Pae(space) => space.translate(address),
+        }
+    }
+
+    pub fn read_virtual(&self, address: u64, out: &mut [u8]) -> Result<()> {
+        match self {
+            Self::X64(space) => space.read_virtual(address, out),
+            Self::X86Pae(space) => space.read_virtual(address, out),
+        }
+    }
+
+    pub fn read_u32(&self, address: u64) -> Result<u32> {
+        let mut bytes = [0u8; 4];
+        self.read_virtual(address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    pub fn read_u64(&self, address: u64) -> Result<u64> {
+        let mut bytes = [0u8; 8];
+        self.read_virtual(address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    pub fn read_pointer(&self, address: u64) -> Result<u64> {
+        match self {
+            Self::X64(space) => space.read_u64(address),
+            Self::X86Pae(space) => space.read_u32(address).map(u64::from),
+        }
+    }
+}
+
 /// Windows x86 PAE address space.
 ///
 /// PAE uses a four-entry PDPT selected by bits 31..30, followed by 512-entry

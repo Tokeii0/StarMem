@@ -154,7 +154,7 @@ pub fn list_drivers(
     limit: usize,
 ) -> Result<PluginReport<DriverRecord>> {
     ensure!(limit > 0, "驱动结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let module_field = |field_name: &str, stable_x64_offset: u64| {
         profile
             .type_field("_KLDR_DATA_TABLE_ENTRY", field_name)
@@ -229,7 +229,7 @@ pub fn list_dlls(
     per_process_limit: usize,
 ) -> Result<PluginReport<DllRecord>> {
     ensure!(per_process_limit > 0, "DLL 结果上限必须大于零");
-    let kernel_space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let kernel_space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
     let pcb = profile.field("Pcb")?.offset;
     let peb = profile.field("Peb")?.offset;
@@ -506,7 +506,7 @@ pub fn list_vads(
     limit: usize,
 ) -> Result<PluginReport<VadRecord>> {
     ensure!(limit > 0, "VAD 结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
     let process = processes
         .processes
@@ -681,7 +681,7 @@ pub fn list_hives(
     limit: usize,
 ) -> Result<PluginReport<HiveRecord>> {
     ensure!(limit > 0, "Hive 结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let hive_list = profile.type_field("_CMHIVE", "HiveList")?.offset;
     let file_path = profile.type_field("_CMHIVE", "FileFullPath")?.offset;
     let user_name = profile.type_field("_CMHIVE", "FileUserName")?.offset;
@@ -743,7 +743,7 @@ pub fn scan_hives(
     limit: usize,
 ) -> Result<PluginReport<HiveScanRecord>> {
     ensure!(limit > 0, "Hive 扫描结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let big = list_big_pools(
         image,
         kernel,
@@ -859,7 +859,7 @@ pub fn check_get_cell_routines(
     limit: usize,
 ) -> Result<GetCellRoutineReport> {
     ensure!(limit > 0, "GetCellRoutine 结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let hives = list_hives(image, kernel, profile, 65_536)?;
     let modules = list_drivers(image, kernel, profile, 65_536)?;
     let hive_offset = profile.type_field("_CMHIVE", "Hive")?.offset;
@@ -1009,7 +1009,7 @@ pub fn list_handles(
     limit: usize,
 ) -> Result<PluginReport<HandleRecord>> {
     ensure!(limit > 0, "句柄结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
     let process = processes
         .processes
@@ -1194,7 +1194,7 @@ pub fn find_handle_owners(
         });
     }
 
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, process_limit)?;
     let object_table_offset = profile.field("ObjectTable")?.offset;
     let table_code_offset = profile.type_field("_HANDLE_TABLE", "TableCode")?.offset;
@@ -1355,7 +1355,7 @@ pub(crate) fn resolve_system_handle_object(
         handle >= 4 && handle.is_multiple_of(4),
         "System 句柄值 {handle:#x} 无效"
     );
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let system_process_pointer = kernel
         .kernel_base
         .checked_add(u64::from(profile.symbol_rva("PsInitialSystemProcess")?))
@@ -1413,7 +1413,7 @@ pub fn scan_network_cancellable(
 ) -> Result<PluginReport<NetworkRecord>> {
     cancellation.check_cancelled()?;
     ensure!(limit > 0, "网络结果上限必须大于零");
-    let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+    let space = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65536)?;
     cancellation.check_cancelled()?;
     let owners: HashMap<u64, _> = processes

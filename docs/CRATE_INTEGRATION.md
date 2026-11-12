@@ -20,7 +20,7 @@ StarMem 0.2 提供同步、纯 Rust 的 `starmem::api`。该模块是唯一承�
 
 ```toml
 [dependencies]
-starmem = { version = "=0.2.0", path = "../../mem" }
+starmem = { version = "=0.2.1", path = "../../mem" }
 ```
 
 发布后改为 crates.io 精确版本，或使用 Git 的精确 `rev`。不要只锁分支。宿主启动时先读取

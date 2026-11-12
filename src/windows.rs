@@ -6,11 +6,13 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::address::{X64AddressSpace, X86PaeAddressSpace};
+use crate::address::{WindowsAddressSpace, X64AddressSpace, X86PaeAddressSpace};
 use crate::image::MemoryImage;
 use crate::profile::{KernelProfile, is_x86_pae_legacy_profile};
 use crate::scan::scan_exact;
-use crate::symbols::{codeview_from_virtual_pe, export_rva_from_virtual_pe};
+use crate::symbols::{
+    codeview_from_address_space, codeview_from_virtual_pe, export_rva_from_virtual_pe,
+};
 
 pub mod autorun_plugins;
 pub mod check_pslist;
@@ -72,8 +74,37 @@ pub enum KernelDiscoveryMethod {
 }
 
 impl WindowsKernelContext {
+    pub fn address_space_for_dtb<'a>(
+        &self,
+        image: &'a MemoryImage,
+        directory_table_base: u64,
+    ) -> Result<WindowsAddressSpace<'a>> {
+        match self.architecture {
+            WindowsArchitecture::X86_64 => {
+                X64AddressSpace::new(image, directory_table_base).map(WindowsAddressSpace::X64)
+            }
+            WindowsArchitecture::X86Pae => X86PaeAddressSpace::new(image, directory_table_base)
+                .map(WindowsAddressSpace::X86Pae),
+        }
+    }
+
+    pub fn address_space<'a>(&self, image: &'a MemoryImage) -> Result<WindowsAddressSpace<'a>> {
+        self.address_space_for_dtb(image, self.directory_table_base)
+    }
+
     pub fn is_x86_pae(&self) -> bool {
         self.architecture == WindowsArchitecture::X86Pae
+    }
+
+    pub(crate) fn x64_address_space<'a>(
+        &self,
+        image: &'a MemoryImage,
+    ) -> Result<X64AddressSpace<'a>> {
+        ensure!(
+            !self.is_x86_pae(),
+            "该插件尚未支持 Windows x86 PAE 的对象布局；请使用支持 x86 的分析引擎补充，不能将此限制解释为零条证据"
+        );
+        X64AddressSpace::new(image, self.directory_table_base)
     }
 
     pub fn discover(image: &MemoryImage, profile: &KernelProfile) -> Result<Self> {
@@ -114,7 +145,7 @@ impl WindowsKernelContext {
     }
 
     fn from_raw(image: &MemoryImage, profile: &KernelProfile) -> Result<Self> {
-        if is_x86_pae_legacy_profile(profile) {
+        if profile.is_x86() {
             return discover_x86_pae_raw_context(image, profile);
         }
         let ps_active_rva = u64::from(profile.symbol_rva("PsActiveProcessHead")?);
@@ -272,6 +303,7 @@ fn discover_x86_pae_raw_context(
             let Ok(space) = X86PaeAddressSpace::new(image, directory_table_base) else {
                 continue;
             };
+            let space = WindowsAddressSpace::X86Pae(space);
             let mut mz = [0u8; 2];
             if space.read_virtual(kernel_base, &mut mz).is_err() || mz != *b"MZ" {
                 continue;
@@ -306,6 +338,18 @@ fn discover_x86_pae_raw_context(
             {
                 continue;
             }
+            // Validate the mapped kernel, rather than an unrelated physical RSDS hit.
+            let Ok(codeview) = codeview_from_address_space(&space, kernel_base) else {
+                continue;
+            };
+            if !codeview
+                .guid
+                .replace('-', "")
+                .eq_ignore_ascii_case(&profile.pdb_guid.replace('-', ""))
+                || codeview.age != profile.pdb_age
+            {
+                continue;
+            }
             return Ok(WindowsKernelContext {
                 architecture: WindowsArchitecture::X86Pae,
                 directory_table_base,
@@ -317,7 +361,7 @@ fn discover_x86_pae_raw_context(
         }
     }
     anyhow::bail!(
-        "Windows XP x86 PAE bootstrap failed: found {kdbg_candidates} decoded KDBG candidate(s) and {system_candidates} physical System EPROCESS candidate(s), but none formed a consistent PAE address space"
+        "Windows x86 PAE bootstrap failed: found {kdbg_candidates} decoded KDBG candidate(s) and {system_candidates} physical System EPROCESS candidate(s), but none formed a consistent PAE address space with the exact kernel CodeView identity"
     )
 }
 
@@ -1128,12 +1172,15 @@ fn list_processes_x86_pae(
     );
     let mut visited = HashMap::new();
     let mut processes = Vec::new();
-    let mut warnings = vec![ProcessListWarning {
-        kind: "legacy_x86_pae".to_owned(),
-        message: "Windows XP SP2 x86 PAE baseline uses an exact CodeView-fingerprinted EPROCESS layout; fields requiring newer x64-only structures are intentionally unavailable"
-            .to_owned(),
-        list_entry: None,
-    }];
+    let mut warnings = Vec::new();
+    if is_x86_pae_legacy_profile(profile) {
+        warnings.push(ProcessListWarning {
+            kind: "legacy_x86_pae".to_owned(),
+            message: "Windows XP SP2 x86 PAE baseline uses an exact CodeView-fingerprinted EPROCESS layout; fields requiring newer x64-only structures are intentionally unavailable"
+                .to_owned(),
+            list_entry: None,
+        });
+    }
     let mut previous_link = head;
     let mut stop_reason = ProcessListStopReason::Limit;
 
@@ -1314,6 +1361,9 @@ fn read_x86_process_details(
         .and_then(|field| space.read_u32(eprocess + pcb + field.offset).ok())
         .map(u64::from)
         .filter(|value| *value != 0);
+    details.section_base_address = field_u32("SectionBaseAddress")
+        .map(u64::from)
+        .filter(|value| *value != 0);
     details.peb = field_u32("Peb").map(u64::from).filter(|value| *value != 0);
     details.object_table = field_u32("ObjectTable")
         .map(u64::from)
@@ -1361,6 +1411,19 @@ fn read_x86_process_details(
                 read_x86_unicode_string(&process_space, parameters + 0x70, 64 * 1024);
             details.desktop_info =
                 read_x86_unicode_string(&process_space, parameters + 0x78, 64 * 1024);
+            // The 32-bit RTL parameters prefix is stable on XP through Win7.
+            // XP has no EnvironmentSize; require the double UTF-16 terminator
+            // rather than reading an invented size or padding missing pages.
+            details.environment_address = process_space
+                .read_u32(parameters + 0x48)
+                .ok()
+                .map(u64::from)
+                .filter(|address| *address != 0);
+            if let Some(address) = details.environment_address
+                && let Some(environment) = read_x86_environment_variables(&process_space, address)
+            {
+                apply_environment_variables(&mut details, environment);
+            }
         }
     }
     details
@@ -1370,6 +1433,36 @@ fn read_x86_u8(space: &X86PaeAddressSpace<'_>, address: u64) -> Option<u8> {
     let mut bytes = [0u8; 1];
     space.read_virtual(address, &mut bytes).ok()?;
     Some(bytes[0])
+}
+
+fn read_x86_environment_variables(
+    space: &X86PaeAddressSpace<'_>,
+    address: u64,
+) -> Option<BTreeMap<String, String>> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if address == 0 || address >= 0x8000_0000 || !address.is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut previous_zero = false;
+    while bytes.len() < MAX_BYTES {
+        let cursor = address.checked_add(bytes.len() as u64)?;
+        if cursor >= 0x8000_0000 {
+            return None;
+        }
+        let length = (4096 - (cursor & 4095) as usize).min(MAX_BYTES - bytes.len());
+        let mut page = vec![0u8; length];
+        space.read_virtual(cursor, &mut page).ok()?;
+        for word in page.chunks_exact(2) {
+            bytes.extend_from_slice(word);
+            let zero = word == [0, 0];
+            if zero && previous_zero {
+                return Some(decode_environment_variables(&bytes));
+            }
+            previous_zero = zero;
+        }
+    }
+    None
 }
 
 fn read_x86_u16(space: &X86PaeAddressSpace<'_>, address: u64) -> Option<u16> {
@@ -1694,20 +1787,7 @@ fn read_peb_details(
     if let (Some(address), Some(size)) = (details.environment_address, details.environment_size)
         && let Some(environment) = read_environment_variables(space, address, size)
     {
-        details.environment_variable_count = Some(environment.len());
-        details.environment_computer_name = environment.get("COMPUTERNAME").cloned();
-        details.environment_user_name = environment.get("USERNAME").cloned();
-        details.environment_user_domain = environment.get("USERDOMAIN").cloned();
-        details.environment_user_profile = environment.get("USERPROFILE").cloned();
-        details.environment_system_root = environment
-            .get("SYSTEMROOT")
-            .or_else(|| environment.get("WINDIR"))
-            .cloned();
-        details.environment_temp = environment
-            .get("TEMP")
-            .or_else(|| environment.get("TMP"))
-            .cloned();
-        details.environment_variables = environment;
+        apply_environment_variables(details, environment);
     }
     evidence
         || details.image_path.is_some()
@@ -1728,6 +1808,30 @@ fn read_environment_variables(
     let byte_length = usize::try_from(byte_length).ok()?;
     let mut bytes = vec![0u8; byte_length];
     space.read_virtual(address, &mut bytes).ok()?;
+    Some(decode_environment_variables(&bytes))
+}
+
+fn apply_environment_variables(
+    details: &mut ProcessDetails,
+    environment: BTreeMap<String, String>,
+) {
+    details.environment_variable_count = Some(environment.len());
+    details.environment_computer_name = environment.get("COMPUTERNAME").cloned();
+    details.environment_user_name = environment.get("USERNAME").cloned();
+    details.environment_user_domain = environment.get("USERDOMAIN").cloned();
+    details.environment_user_profile = environment.get("USERPROFILE").cloned();
+    details.environment_system_root = environment
+        .get("SYSTEMROOT")
+        .or_else(|| environment.get("WINDIR"))
+        .cloned();
+    details.environment_temp = environment
+        .get("TEMP")
+        .or_else(|| environment.get("TMP"))
+        .cloned();
+    details.environment_variables = environment;
+}
+
+fn decode_environment_variables(bytes: &[u8]) -> BTreeMap<String, String> {
     let words = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -1748,7 +1852,7 @@ fn read_environment_variables(
             .entry(name.to_ascii_uppercase())
             .or_insert_with(|| value.to_owned());
     }
-    Some(variables)
+    variables
 }
 
 fn read_token_details(

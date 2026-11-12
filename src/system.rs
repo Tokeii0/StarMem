@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use serde::Serialize;
 
-use crate::address::X64AddressSpace;
+use crate::address::WindowsAddressSpace;
 use crate::session::AnalysisSession;
 use crate::windows::WindowsArchitecture;
 use crate::windows::plugins::{NetworkRecord, PluginReport};
@@ -272,7 +272,16 @@ fn analyze_system_info_inner(
     include_deep_sources: bool,
 ) -> Result<SystemInfoReport> {
     let process_report = session.processes(process_limit)?;
-    let network_report = if include_deep_sources {
+    let network_report = if include_deep_sources && session.kernel().is_x86_pae() {
+        match session.network(network_limit) {
+            Ok(report) => report,
+            Err(error) => PluginReport {
+                records: Vec::new(),
+                complete: false,
+                warnings: vec![format!("网络端点证据不可用（不代表无网络连接）：{error:#}")],
+            },
+        }
+    } else if include_deep_sources {
         session.network(network_limit)?
     } else {
         PluginReport {
@@ -288,13 +297,18 @@ fn analyze_system_info_inner(
     } else {
         RegistrySystemInfo::default()
     };
-    let space = X64AddressSpace::new(session.image(), session.kernel().directory_table_base)?;
+    let space = session.kernel().address_space(session.image())?;
     let profile = session.profile();
+    let shared_data_address = if session.kernel().is_x86_pae() {
+        0xffdf_0000
+    } else {
+        KUSER_SHARED_DATA
+    };
     let shared = |field: &str| {
         profile
             .type_field("_KUSER_SHARED_DATA", field)
             .ok()
-            .map(|field| KUSER_SHARED_DATA + field.offset)
+            .map(|field| shared_data_address + field.offset)
     };
 
     let system_time_raw =
@@ -490,16 +504,14 @@ fn analyze_system_info_inner(
         .iter()
         .find_map(|process| process.details.peb_os_build_number)
         .map(u32::from);
-    let major = shared("NtMajorVersion")
+    let shared_major = shared("NtMajorVersion").and_then(|address| read_u32(&space, address));
+    let shared_minor = shared("NtMinorVersion").and_then(|address| read_u32(&space, address));
+    let shared_build = shared("NtBuildNumber")
         .and_then(|address| read_u32(&space, address))
-        .or(process_major);
-    let minor = shared("NtMinorVersion")
-        .and_then(|address| read_u32(&space, address))
-        .or(process_minor);
-    let build = shared("NtBuildNumber")
-        .and_then(|address| read_u32(&space, address))
-        .map(|value| value & 0xffff)
-        .or(process_build);
+        .map(|value| value & 0xffff);
+    let major = shared_major.or(process_major);
+    let minor = shared_minor.or(process_minor);
+    let build = shared_build.or(process_build);
     let system_root =
         shared("NtSystemRoot").and_then(|address| read_fixed_utf16(&space, address, 260));
     let product_type = shared("NtProductType")
@@ -527,14 +539,19 @@ fn analyze_system_info_inner(
         build.or(registry_build),
         registry.product.ubr,
     );
-    let system_version_source = if session.kernel().is_x86_pae()
+    let system_version_source = if shared_major.is_some()
+        && shared_minor.is_some()
+        && shared_build.is_some()
+    {
+        "_KUSER_SHARED_DATA.NtMajorVersion/NtMinorVersion/NtBuildNumber；修订号来自 SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\UBR"
+    } else if shared_major.is_some() && shared_minor.is_some() && process_build.is_some() {
+        "_KUSER_SHARED_DATA.NtMajorVersion/NtMinorVersion；Build 来自进程 PEB.OSBuildNumber，修订号来自 SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\UBR"
+    } else if session.kernel().is_x86_pae()
         && process_major.is_some()
         && process_minor.is_some()
         && process_build.is_some()
     {
-        "Windows XP x86 PAE 进程 PEB 的 OSMajorVersion/OSMinorVersion/OSBuildNumber"
-    } else if major.is_some() && minor.is_some() && build.is_some() {
-        "_KUSER_SHARED_DATA.NtMajorVersion/NtMinorVersion/NtBuildNumber；修订号来自 SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\UBR"
+        "Windows x86 PAE 进程 PEB 的 OSMajorVersion/OSMinorVersion/OSBuildNumber"
     } else {
         "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion 的主版本、次版本、Build 与 UBR"
     };
@@ -696,7 +713,7 @@ fn analyze_system_info_inner(
 
 fn read_kernel_c_string(
     session: &AnalysisSession,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     symbol: &str,
     limit: usize,
 ) -> Option<String> {
@@ -717,7 +734,7 @@ fn read_kernel_c_string(
 
 fn read_kernel_u64(
     session: &AnalysisSession,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     symbol: &str,
 ) -> Option<u64> {
     space.read_u64(kernel_symbol_address(session, symbol)?).ok()
@@ -725,7 +742,7 @@ fn read_kernel_u64(
 
 fn read_kernel_u32(
     session: &AnalysisSession,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     symbol: &str,
 ) -> Option<u32> {
     read_u32(space, kernel_symbol_address(session, symbol)?)
@@ -733,7 +750,7 @@ fn read_kernel_u32(
 
 fn read_kernel_u8(
     session: &AnalysisSession,
-    space: &X64AddressSpace<'_>,
+    space: &WindowsAddressSpace<'_>,
     symbol: &str,
 ) -> Option<u8> {
     read_u8(space, kernel_symbol_address(session, symbol)?)
@@ -747,7 +764,7 @@ fn kernel_symbol_address(session: &AnalysisSession, symbol: &str) -> Option<u64>
         .and_then(|rva| session.kernel().kernel_base.checked_add(u64::from(*rva)))
 }
 
-fn read_ksystem_time(space: &X64AddressSpace<'_>, address: u64) -> Option<u64> {
+fn read_ksystem_time(space: &WindowsAddressSpace<'_>, address: u64) -> Option<u64> {
     let low = u64::from(read_u32(space, address)?);
     let high1 = u64::from(read_u32(space, address.checked_add(4)?)?);
     let high2 = u64::from(read_u32(space, address.checked_add(8)?)?);
@@ -755,7 +772,11 @@ fn read_ksystem_time(space: &X64AddressSpace<'_>, address: u64) -> Option<u64> {
     Some((high << 32) | low)
 }
 
-fn read_fixed_utf16(space: &X64AddressSpace<'_>, address: u64, max_words: usize) -> Option<String> {
+fn read_fixed_utf16(
+    space: &WindowsAddressSpace<'_>,
+    address: u64,
+    max_words: usize,
+) -> Option<String> {
     let mut bytes = vec![0u8; max_words.checked_mul(2)?];
     space.read_virtual(address, &mut bytes).ok()?;
     let words = bytes
@@ -766,13 +787,13 @@ fn read_fixed_utf16(space: &X64AddressSpace<'_>, address: u64, max_words: usize)
     (!words.is_empty()).then(|| String::from_utf16_lossy(&words))
 }
 
-fn read_u8(space: &X64AddressSpace<'_>, address: u64) -> Option<u8> {
+fn read_u8(space: &WindowsAddressSpace<'_>, address: u64) -> Option<u8> {
     let mut bytes = [0u8; 1];
     space.read_virtual(address, &mut bytes).ok()?;
     Some(bytes[0])
 }
 
-fn read_u32(space: &X64AddressSpace<'_>, address: u64) -> Option<u32> {
+fn read_u32(space: &WindowsAddressSpace<'_>, address: u64) -> Option<u32> {
     let mut bytes = [0u8; 4];
     space.read_virtual(address, &mut bytes).ok()?;
     Some(u32::from_le_bytes(bytes))

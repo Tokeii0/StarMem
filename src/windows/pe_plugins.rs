@@ -149,6 +149,7 @@ pub fn ldr_modules(
     limit: usize,
 ) -> Result<LdrModulesReport> {
     ensure!(limit > 0, "ldrmodules 结果上限必须大于零");
+    let _ = kernel.x64_address_space(image)?;
     let processes = list_processes(image, kernel, profile, 65_536)?;
     let mut records = Vec::new();
     let mut warnings = process_warnings(&processes);
@@ -427,7 +428,7 @@ pub fn pe_symbols(
             let modules = list_drivers(image, kernel, profile, 65_536)?;
             warnings.extend(modules.warnings);
             complete &= modules.complete;
-            let space = X64AddressSpace::new(image, kernel.directory_table_base)?;
+            let space = kernel.x64_address_space(image)?;
             for module in modules
                 .records
                 .iter()
@@ -585,10 +586,7 @@ pub fn dump_pe(
     output_policy.preflight()?;
 
     let (space, process_name) = if kernel_module {
-        (
-            X64AddressSpace::new(image, kernel.directory_table_base)?,
-            "Kernel".to_owned(),
-        )
+        (kernel.x64_address_space(image)?, "Kernel".to_owned())
     } else {
         let wanted_pid = pid.expect("validated above");
         let processes = list_processes(image, kernel, profile, 65_536)?;

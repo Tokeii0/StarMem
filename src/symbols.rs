@@ -10,7 +10,7 @@ use pdb::FallibleIterator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::address::X64AddressSpace;
+use crate::address::{WindowsAddressSpace, X64AddressSpace};
 use crate::image::MemoryImage;
 use crate::output_policy::{OutputPolicy, OutputTarget};
 use crate::scan::scan_exact;
@@ -233,7 +233,7 @@ fn discover_kernel_codeview(image: &MemoryImage) -> Result<Option<CodeViewRecord
     let kernel_base = kernel_base_from_kdbg(&address_space, dump.kd_debugger_data_block)
         .or_else(|_| kernel_base_from_module_list(&address_space, dump.ps_loaded_module_list))?;
     Ok(Some(codeview_from_address_space(
-        &address_space,
+        &WindowsAddressSpace::X64(address_space),
         kernel_base,
     )?))
 }
@@ -244,7 +244,7 @@ pub fn codeview_from_virtual_pe(
     image_base: u64,
 ) -> Result<CodeViewRecord> {
     let address_space = X64AddressSpace::new(image, directory_table_base)?;
-    codeview_from_address_space(&address_space, image_base)
+    codeview_from_address_space(&WindowsAddressSpace::X64(address_space), image_base)
 }
 
 pub fn export_rva_from_virtual_pe(
@@ -332,8 +332,8 @@ fn read_virtual_u32(address_space: &X64AddressSpace<'_>, address: u64) -> Result
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn codeview_from_address_space(
-    address_space: &X64AddressSpace<'_>,
+pub(crate) fn codeview_from_address_space(
+    address_space: &WindowsAddressSpace<'_>,
     image_base: u64,
 ) -> Result<CodeViewRecord> {
     let mut dos = [0u8; 64];
@@ -345,11 +345,15 @@ fn codeview_from_address_space(
     address_space.read_virtual(image_base + pe_offset, &mut nt_headers)?;
     ensure!(nt_headers.starts_with(b"PE\0\0"), "内核 PE 签名无效");
     let optional_offset = 24usize;
-    ensure!(
-        read_u16(&nt_headers, optional_offset)? == 0x20b,
-        "映像不是 PE32+"
-    );
-    let debug_directory_offset = optional_offset + 0x70 + 6 * 8;
+    let directory_offset = match (
+        address_space.pointer_size(),
+        read_u16(&nt_headers, optional_offset)?,
+    ) {
+        (4, 0x10b) => 0x60,
+        (8, 0x20b) => 0x70,
+        _ => bail!("PE optional header 与目标地址空间架构不匹配"),
+    };
+    let debug_directory_offset = optional_offset + directory_offset + 6 * 8;
     let debug_rva = read_u32(&nt_headers, debug_directory_offset)? as u64;
     let debug_size = read_u32(&nt_headers, debug_directory_offset + 4)? as usize;
     ensure!(debug_rva != 0 && debug_size >= 28, "PE 映像没有调试目录");

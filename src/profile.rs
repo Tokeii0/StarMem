@@ -209,6 +209,17 @@ pub struct FieldProfile {
 }
 
 impl KernelProfile {
+    /// HANDLE is pointer-sized; concrete LIST_ENTRY layouts provide a fallback.
+    pub fn is_x86(&self) -> bool {
+        self.fields
+            .get("UniqueProcessId")
+            .is_some_and(|field| field.size == Some(4))
+            || self
+                .fields
+                .get("ActiveProcessLinks")
+                .is_some_and(|field| field.size == Some(8))
+    }
+
     pub fn field(&self, name: &str) -> Result<&FieldProfile> {
         self.fields
             .get(name)
@@ -429,6 +440,9 @@ pub fn build_eprocess_profile(path: &Path) -> Result<KernelProfile> {
         let info = pdb.pdb_information()?;
         (info.guid.to_string().to_uppercase(), info.age)
     };
+    // Public PDB stripping can advance the information-stream age; DBI retains
+    // the image's CodeView age (e.g. Win7 ntkrpamp: information=5, DBI=2).
+    let pdb_age = pdb.debug_information()?.age().unwrap_or(pdb_age);
 
     let types = {
         let type_information = pdb.type_information()?;
@@ -630,6 +644,12 @@ fn requested_symbol_name<'a>(raw_name: &str, names: &[&'a str]) -> Option<&'a st
     if let Some(name) = names.iter().copied().find(|name| *name == raw_name) {
         return Some(name);
     }
+    // x86 C data symbols have one leading underscore in Microsoft PDBs.
+    if let Some(base_name) = raw_name.strip_prefix('_')
+        && let Some(name) = names.iter().copied().find(|name| *name == base_name)
+    {
+        return Some(name);
+    }
     let decorated = raw_name.strip_prefix('?')?;
     let (base_name, suffix) = decorated.split_once("@@")?;
     if !suffix.starts_with('3') {
@@ -678,19 +698,42 @@ fn type_size(finder: &TypeFinder<'_>, index: TypeIndex, depth: usize) -> Result<
         return Ok(None);
     }
     let size = match finder.find(index)?.parse()? {
-        TypeData::Primitive(primitive) if primitive.indirection.is_some() => Some(8),
+        TypeData::Primitive(primitive) if primitive.indirection.is_some() => {
+            primitive.indirection.map(|indirection| match indirection {
+                pdb::Indirection::Near16 => 2,
+                pdb::Indirection::Far16 | pdb::Indirection::Huge16 | pdb::Indirection::Near32 => 4,
+                pdb::Indirection::Far32 => 6,
+                pdb::Indirection::Near64 => 8,
+                pdb::Indirection::Near128 => 16,
+            })
+        }
         TypeData::Primitive(primitive) => match primitive.kind {
             pdb::PrimitiveKind::Char
             | pdb::PrimitiveKind::UChar
             | pdb::PrimitiveKind::I8
             | pdb::PrimitiveKind::U8
             | pdb::PrimitiveKind::Bool8 => Some(1),
-            pdb::PrimitiveKind::I16 | pdb::PrimitiveKind::U16 => Some(2),
-            pdb::PrimitiveKind::I32 | pdb::PrimitiveKind::U32 | pdb::PrimitiveKind::F32 => Some(4),
-            pdb::PrimitiveKind::I64 | pdb::PrimitiveKind::U64 | pdb::PrimitiveKind::F64 => Some(8),
+            pdb::PrimitiveKind::I16
+            | pdb::PrimitiveKind::U16
+            | pdb::PrimitiveKind::Short
+            | pdb::PrimitiveKind::UShort
+            | pdb::PrimitiveKind::WChar => Some(2),
+            pdb::PrimitiveKind::I32
+            | pdb::PrimitiveKind::U32
+            | pdb::PrimitiveKind::F32
+            | pdb::PrimitiveKind::Long
+            | pdb::PrimitiveKind::ULong => Some(4),
+            pdb::PrimitiveKind::I64
+            | pdb::PrimitiveKind::U64
+            | pdb::PrimitiveKind::F64
+            | pdb::PrimitiveKind::Quad
+            | pdb::PrimitiveKind::UQuad => Some(8),
             _ => None,
         },
-        TypeData::Pointer(_) => Some(8),
+        TypeData::Pointer(pointer) => {
+            let size = pointer.attributes.size();
+            (size != 0).then_some(u64::from(size))
+        }
         TypeData::Array(array) => array.dimensions.last().copied().map(u64::from),
         TypeData::Class(class) => Some(class.size),
         TypeData::Union(union) => Some(union.size),
@@ -704,6 +747,32 @@ fn type_size(finder: &TypeFinder<'_>, index: TypeIndex, depth: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::requested_symbol_name;
+
+    #[test]
+    fn recognizes_x86_c_data_globals_without_matching_stdcall_functions() {
+        let names = [
+            "PsActiveProcessHead",
+            "PsLoadedModuleList",
+            "_already_prefixed",
+        ];
+        assert_eq!(
+            requested_symbol_name("_PsActiveProcessHead", &names),
+            Some("PsActiveProcessHead")
+        );
+        assert_eq!(
+            requested_symbol_name("_PsLoadedModuleList", &names),
+            Some("PsLoadedModuleList")
+        );
+        assert_eq!(
+            requested_symbol_name("_already_prefixed", &names),
+            Some("_already_prefixed")
+        );
+        assert_eq!(requested_symbol_name("__PsActiveProcessHead", &names), None);
+        assert_eq!(
+            requested_symbol_name("_PsActiveProcessHead@4", &names),
+            None
+        );
+    }
 
     #[test]
     fn recognizes_msvc_decorated_data_globals_only() {
